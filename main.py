@@ -21,6 +21,7 @@ import sys
 import time
 import json
 import threading
+from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
 
 import ollama
@@ -436,6 +437,9 @@ def print_commands():
     safe_print("/ping                    → quick generation test")
     safe_print("/health                  → deeper health check")
     safe_print("/debug                   → internal status")
+    safe_print("/notes                   → show recent visit notes")
+    safe_print("/export [file]           → export visit notes to JSON")
+    safe_print("/help                    → show commands")
     safe_print("quit")
 
 def ping_model(model: str) -> str:
@@ -499,6 +503,38 @@ def normalize_patient_input(s: str) -> Optional[str]:
     return s
 
 
+def detect_red_flags(text: str) -> List[str]:
+    """
+    Simple keyword-based safety net so urgent symptoms are called out immediately.
+    """
+    t = (text or "").lower()
+    flag_keywords = {
+        "possible chest pain emergency": ["chest pain", "pressure in chest", "crushing pain"],
+        "possible breathing emergency": ["can't breathe", "cannot breathe", "shortness of breath", "trouble breathing"],
+        "possible stroke symptoms": ["face droop", "slurred speech", "one side weak", "numb on one side"],
+        "possible severe bleeding": ["heavy bleeding", "won't stop bleeding", "coughing blood", "vomiting blood"],
+        "possible self-harm crisis": ["suicidal", "want to die", "kill myself", "harm myself"],
+        "possible anaphylaxis/allergic emergency": ["swollen tongue", "swollen throat", "anaphylaxis"],
+        "possible loss-of-consciousness concern": ["fainted", "passed out", "unconscious"],
+    }
+    hits = []
+    for label, kws in flag_keywords.items():
+        if any(k in t for k in kws):
+            hits.append(label)
+    return hits
+
+
+def save_visit_log(path: str, turns: List[Dict[str, Any]]) -> str:
+    path = (path or "visit_log.json").strip()
+    payload = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "turns": turns,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
 # =====================
 # MAIN
 # =====================
@@ -532,6 +568,8 @@ def main():
     safe_print("You are the patient. Describe what brings you in today.\n")
     safe_print("Tip: If Ollama ever stalls, try /health or /models.\n")
 
+    visit_turns: List[Dict[str, Any]] = []
+
     while True:
         print_commands()
         try:
@@ -544,6 +582,10 @@ def main():
 
         if user_input.lower() == "quit":
             break
+
+        if user_input == "/help":
+            print_commands()
+            continue
 
         # ---- diagnostics commands ----
         if user_input == "/debug":
@@ -654,6 +696,27 @@ def main():
                 safe_print(f"\n[health] FAILED: {e}")
             continue
 
+        if user_input == "/notes":
+            if not visit_turns:
+                safe_print("No visit notes yet.")
+                continue
+            safe_print("\nRecent visit notes:")
+            for idx, turn in enumerate(visit_turns[-5:], 1):
+                safe_print(f"{idx}. {turn.get('timestamp')} | patient={repr((turn.get('patient') or '')[:90])}")
+                if turn.get("red_flags"):
+                    safe_print(f"   red_flags={', '.join(turn['red_flags'])}")
+            continue
+
+        if user_input.startswith("/export"):
+            parts = user_input.split(" ", 1)
+            out_path = parts[1].strip() if len(parts) == 2 and parts[1].strip() else "visit_log.json"
+            try:
+                written = save_visit_log(out_path, visit_turns)
+                safe_print(f"Saved visit log to: {written}")
+            except Exception as e:
+                safe_print(f"Failed to export visit log: {e}")
+            continue
+
         # ---- memory/mood/style/reset commands ----
         if user_input.startswith("/m "):
             parts = user_input.split(" ", 2)
@@ -704,6 +767,13 @@ def main():
         if not patient_text:
             continue
 
+        red_flags = detect_red_flags(patient_text)
+        if red_flags:
+            safe_print("\n[safety-check] Potential red flags detected:")
+            for rf in red_flags:
+                safe_print(f" - {rf}")
+            safe_print("If symptoms are severe or worsening, seek urgent/emergency care now.")
+
         try:
             # 1) Patient -> Nurse
             nurse.receive("user", patient_text)
@@ -724,6 +794,19 @@ def main():
             nurse.receive("user", "Now respond to the patient. Be clear and ask the next 1–3 questions if needed.")
             nurse_followup = nurse.respond(phase_label="follow-up")
             safe_print(f"\n[{nurse.name}] {nurse_followup}")
+
+            visit_turns.append({
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "patient": patient_text,
+                "red_flags": red_flags,
+                "nurse_initial": nurse_reply,
+                "doctor_note": doctor_note,
+                "nurse_followup": nurse_followup,
+                "models": {
+                    "nurse": nurse.model,
+                    "doctor": doctor.model,
+                }
+            })
 
         except TimeoutError as te:
             safe_print(f"\n[error] Model call timed out: {te}")
