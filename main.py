@@ -23,8 +23,9 @@ import json
 import threading
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
-import ollama
 
 
 # =====================
@@ -41,9 +42,8 @@ FALLBACK_MODELS = [
     os.getenv("FALLBACK_MODEL_2", "phi3:mini"),
 ]
 
-# If you are using a remote Ollama host, set:
-#   export OLLAMA_HOST=http://YOUR_HOST:11434
-# The ollama python client typically respects this env var.
+# Hardcoded default host so the app works without local Ollama setup.
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://qrix.fun:11434").rstrip("/")
 
 
 # =====================
@@ -150,11 +150,62 @@ class Spinner:
 # UTIL: timed ollama calls with retry + backoff + failover
 # =====================
 
+def _ollama_api_post(path: str, payload: Dict[str, Any], timeout_s: int = 60) -> Dict[str, Any]:
+    url = f"{OLLAMA_HOST}{path}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+    except urlerror.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+        raise RuntimeError(f"HTTP {e.code} from {url}: {detail}") from e
+    except urlerror.URLError as e:
+        raise RuntimeError(f"Failed connecting to {url}: {e}") from e
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid JSON from {url}: {raw[:200]}") from e
+
+
+def _ollama_api_get(path: str, timeout_s: int = 30) -> Dict[str, Any]:
+    url = f"{OLLAMA_HOST}{path}"
+    req = urlrequest.Request(url, method="GET")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+    except urlerror.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+        raise RuntimeError(f"HTTP {e.code} from {url}: {detail}") from e
+    except urlerror.URLError as e:
+        raise RuntimeError(f"Failed connecting to {url}: {e}") from e
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid JSON from {url}: {raw[:200]}") from e
+
+
 def _ollama_chat_worker(model: str, messages: List[Dict[str, str]], options: Dict[str, Any],
                         out: Dict[str, Any], err: Dict[str, Exception]):
     try:
-        resp = ollama.chat(model=model, messages=messages, options=options)
-        out["text"] = resp["message"]["content"]
+        resp = _ollama_api_post(
+            "/api/chat",
+            {
+                "model": model,
+                "messages": messages,
+                "options": options,
+                "stream": False,
+            },
+            timeout_s=360,
+        )
+        out["text"] = ((resp.get("message") or {}).get("content") or "")
     except Exception as e:
         err["e"] = e
 
@@ -230,7 +281,7 @@ def try_models_with_failover(
 
 def ollama_list_models(timeout_s: int = 10) -> List[str]:
     """
-    Lists locally available models via ollama.list().
+    Lists available models via Ollama /api/tags.
     If the server is wedged, this can also hang; so we timebox it.
     """
     out: Dict[str, Any] = {}
@@ -238,7 +289,7 @@ def ollama_list_models(timeout_s: int = 10) -> List[str]:
 
     def worker():
         try:
-            out["resp"] = ollama.list()
+            out["resp"] = _ollama_api_get("/api/tags", timeout_s=timeout_s)
         except Exception as e:
             err["e"] = e
 
@@ -567,6 +618,9 @@ def main():
     safe_print("\n=== Clinic Roleplay Engine (Patient ↔ Nurse Zesty ↔ Doctor Scarlett) ===\n")
     safe_print("You are the patient. Describe what brings you in today.\n")
     safe_print("Tip: If Ollama ever stalls, try /health or /models.\n")
+    safe_print(f"Ollama host: {OLLAMA_HOST}\n")
+
+    visit_turns: List[Dict[str, Any]] = []
 
     visit_turns: List[Dict[str, Any]] = []
 
@@ -621,12 +675,15 @@ def main():
                 safe_print("Usage: /setmodel <agent> <name>")
                 continue
             _, who, name = parts
-            if who.lower() == "zesty":
+            who_l = who.lower().strip()
+            if who_l == "zesty":
                 nurse.model = name.strip()
                 safe_print(f"Set nurse model to: {nurse.model}")
-            else:
+            elif who_l == "scarlett":
                 doctor.model = name.strip()
                 safe_print(f"Set doctor model to: {doctor.model}")
+            else:
+                safe_print("Agent must be 'zesty' or 'scarlett'.")
             continue
 
         if user_input.startswith("/settimeout "):
