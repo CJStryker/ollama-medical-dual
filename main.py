@@ -21,9 +21,11 @@ import sys
 import time
 import json
 import threading
+from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
-import ollama
 
 
 # =====================
@@ -40,9 +42,8 @@ FALLBACK_MODELS = [
     os.getenv("FALLBACK_MODEL_2", "phi3:mini"),
 ]
 
-# If you are using a remote Ollama host, set:
-#   export OLLAMA_HOST=http://YOUR_HOST:11434
-# The ollama python client typically respects this env var.
+# Hardcoded default host so the app works without local Ollama setup.
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://qrix.fun:11434").rstrip("/")
 
 
 # =====================
@@ -149,11 +150,62 @@ class Spinner:
 # UTIL: timed ollama calls with retry + backoff + failover
 # =====================
 
+def _ollama_api_post(path: str, payload: Dict[str, Any], timeout_s: int = 60) -> Dict[str, Any]:
+    url = f"{OLLAMA_HOST}{path}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+    except urlerror.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+        raise RuntimeError(f"HTTP {e.code} from {url}: {detail}") from e
+    except urlerror.URLError as e:
+        raise RuntimeError(f"Failed connecting to {url}: {e}") from e
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid JSON from {url}: {raw[:200]}") from e
+
+
+def _ollama_api_get(path: str, timeout_s: int = 30) -> Dict[str, Any]:
+    url = f"{OLLAMA_HOST}{path}"
+    req = urlrequest.Request(url, method="GET")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+    except urlerror.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+        raise RuntimeError(f"HTTP {e.code} from {url}: {detail}") from e
+    except urlerror.URLError as e:
+        raise RuntimeError(f"Failed connecting to {url}: {e}") from e
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid JSON from {url}: {raw[:200]}") from e
+
+
 def _ollama_chat_worker(model: str, messages: List[Dict[str, str]], options: Dict[str, Any],
                         out: Dict[str, Any], err: Dict[str, Exception]):
     try:
-        resp = ollama.chat(model=model, messages=messages, options=options)
-        out["text"] = resp["message"]["content"]
+        resp = _ollama_api_post(
+            "/api/chat",
+            {
+                "model": model,
+                "messages": messages,
+                "options": options,
+                "stream": False,
+            },
+            timeout_s=360,
+        )
+        out["text"] = ((resp.get("message") or {}).get("content") or "")
     except Exception as e:
         err["e"] = e
 
@@ -229,7 +281,7 @@ def try_models_with_failover(
 
 def ollama_list_models(timeout_s: int = 10) -> List[str]:
     """
-    Lists locally available models via ollama.list().
+    Lists available models via Ollama /api/tags.
     If the server is wedged, this can also hang; so we timebox it.
     """
     out: Dict[str, Any] = {}
@@ -237,7 +289,7 @@ def ollama_list_models(timeout_s: int = 10) -> List[str]:
 
     def worker():
         try:
-            out["resp"] = ollama.list()
+            out["resp"] = _ollama_api_get("/api/tags", timeout_s=timeout_s)
         except Exception as e:
             err["e"] = e
 
@@ -436,6 +488,9 @@ def print_commands():
     safe_print("/ping                    → quick generation test")
     safe_print("/health                  → deeper health check")
     safe_print("/debug                   → internal status")
+    safe_print("/notes                   → show recent visit notes")
+    safe_print("/export [file]           → export visit notes to JSON")
+    safe_print("/help                    → show commands")
     safe_print("quit")
 
 def ping_model(model: str) -> str:
@@ -499,6 +554,38 @@ def normalize_patient_input(s: str) -> Optional[str]:
     return s
 
 
+def detect_red_flags(text: str) -> List[str]:
+    """
+    Simple keyword-based safety net so urgent symptoms are called out immediately.
+    """
+    t = (text or "").lower()
+    flag_keywords = {
+        "possible chest pain emergency": ["chest pain", "pressure in chest", "crushing pain"],
+        "possible breathing emergency": ["can't breathe", "cannot breathe", "shortness of breath", "trouble breathing"],
+        "possible stroke symptoms": ["face droop", "slurred speech", "one side weak", "numb on one side"],
+        "possible severe bleeding": ["heavy bleeding", "won't stop bleeding", "coughing blood", "vomiting blood"],
+        "possible self-harm crisis": ["suicidal", "want to die", "kill myself", "harm myself"],
+        "possible anaphylaxis/allergic emergency": ["swollen tongue", "swollen throat", "anaphylaxis"],
+        "possible loss-of-consciousness concern": ["fainted", "passed out", "unconscious"],
+    }
+    hits = []
+    for label, kws in flag_keywords.items():
+        if any(k in t for k in kws):
+            hits.append(label)
+    return hits
+
+
+def save_visit_log(path: str, turns: List[Dict[str, Any]]) -> str:
+    path = (path or "visit_log.json").strip()
+    payload = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "turns": turns,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
 # =====================
 # MAIN
 # =====================
@@ -531,6 +618,9 @@ def main():
     safe_print("\n=== Clinic Roleplay Engine (Patient ↔ Nurse Zesty ↔ Doctor Scarlett) ===\n")
     safe_print("You are the patient. Describe what brings you in today.\n")
     safe_print("Tip: If Ollama ever stalls, try /health or /models.\n")
+    safe_print(f"Ollama host: {OLLAMA_HOST}\n")
+
+    visit_turns: List[Dict[str, Any]] = []
 
     while True:
         print_commands()
@@ -544,6 +634,10 @@ def main():
 
         if user_input.lower() == "quit":
             break
+
+        if user_input == "/help":
+            print_commands()
+            continue
 
         # ---- diagnostics commands ----
         if user_input == "/debug":
@@ -579,12 +673,15 @@ def main():
                 safe_print("Usage: /setmodel <agent> <name>")
                 continue
             _, who, name = parts
-            if who.lower() == "zesty":
+            who_l = who.lower().strip()
+            if who_l == "zesty":
                 nurse.model = name.strip()
                 safe_print(f"Set nurse model to: {nurse.model}")
-            else:
+            elif who_l == "scarlett":
                 doctor.model = name.strip()
                 safe_print(f"Set doctor model to: {doctor.model}")
+            else:
+                safe_print("Agent must be 'zesty' or 'scarlett'.")
             continue
 
         if user_input.startswith("/settimeout "):
@@ -654,6 +751,27 @@ def main():
                 safe_print(f"\n[health] FAILED: {e}")
             continue
 
+        if user_input == "/notes":
+            if not visit_turns:
+                safe_print("No visit notes yet.")
+                continue
+            safe_print("\nRecent visit notes:")
+            for idx, turn in enumerate(visit_turns[-5:], 1):
+                safe_print(f"{idx}. {turn.get('timestamp')} | patient={repr((turn.get('patient') or '')[:90])}")
+                if turn.get("red_flags"):
+                    safe_print(f"   red_flags={', '.join(turn['red_flags'])}")
+            continue
+
+        if user_input.startswith("/export"):
+            parts = user_input.split(" ", 1)
+            out_path = parts[1].strip() if len(parts) == 2 and parts[1].strip() else "visit_log.json"
+            try:
+                written = save_visit_log(out_path, visit_turns)
+                safe_print(f"Saved visit log to: {written}")
+            except Exception as e:
+                safe_print(f"Failed to export visit log: {e}")
+            continue
+
         # ---- memory/mood/style/reset commands ----
         if user_input.startswith("/m "):
             parts = user_input.split(" ", 2)
@@ -704,6 +822,13 @@ def main():
         if not patient_text:
             continue
 
+        red_flags = detect_red_flags(patient_text)
+        if red_flags:
+            safe_print("\n[safety-check] Potential red flags detected:")
+            for rf in red_flags:
+                safe_print(f" - {rf}")
+            safe_print("If symptoms are severe or worsening, seek urgent/emergency care now.")
+
         try:
             # 1) Patient -> Nurse
             nurse.receive("user", patient_text)
@@ -724,6 +849,19 @@ def main():
             nurse.receive("user", "Now respond to the patient. Be clear and ask the next 1–3 questions if needed.")
             nurse_followup = nurse.respond(phase_label="follow-up")
             safe_print(f"\n[{nurse.name}] {nurse_followup}")
+
+            visit_turns.append({
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "patient": patient_text,
+                "red_flags": red_flags,
+                "nurse_initial": nurse_reply,
+                "doctor_note": doctor_note,
+                "nurse_followup": nurse_followup,
+                "models": {
+                    "nurse": nurse.model,
+                    "doctor": doctor.model,
+                }
+            })
 
         except TimeoutError as te:
             safe_print(f"\n[error] Model call timed out: {te}")
