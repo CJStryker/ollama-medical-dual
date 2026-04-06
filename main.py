@@ -599,10 +599,12 @@ class ClinicSession:
     def process_patient_message(self, user_text: str) -> Dict[str, Any]:
         patient_text = normalize_patient_input(user_text)
         if not patient_text:
+            ui = build_ui_actions([], doctor_note=None, ok=False, error="low_info_input")
             return {
                 "ok": False,
                 "error": "Input too short/low information. Ask user for one complete sentence.",
                 "red_flags": [],
+                "ui": ui,
             }
 
         red_flags = detect_red_flags(patient_text)
@@ -646,12 +648,15 @@ class ClinicSession:
                 "doctor_note": doctor_note,
                 "nurse_followup": nurse_followup,
                 "turn": turn,
+                "ui": build_ui_actions(red_flags, doctor_note=doctor_note, ok=True),
             }
         except Exception as e:
+            ui = build_ui_actions(red_flags, doctor_note=doctor_note, ok=False, error=str(e))
             return {
                 "ok": False,
                 "error": str(e),
                 "red_flags": red_flags,
+                "ui": ui,
             }
 
 
@@ -673,6 +678,7 @@ def print_commands():
     safe_print("/sethost <url>           → set primary Ollama host")
     safe_print("/safety <text>           → run red-flag detection on text")
     safe_print("/stats                   → show API call stats")
+    safe_print("/runtests                → run built-in 25-case safety suite")
     safe_print("/ping                    → quick generation test")
     safe_print("/health                  → deeper health check")
     safe_print("/debug                   → internal status")
@@ -779,6 +785,8 @@ def detect_red_flags(text: str) -> List[str]:
         "facial droop",
         "slurred speech",
         "one side weak",
+        "weakness on one side",
+        "one sided weakness",
         "numb on one side",
         "sudden weakness one side",
     ):
@@ -801,7 +809,10 @@ def detect_red_flags(text: str) -> List[str]:
         "harm myself",
         "end my life",
         "self harm",
-    ):
+        "overdose tonight",
+        "dont want to wake up",
+        "do not want to wake up",
+    ) and not has_phrase("not suicidal", "no suicidal thoughts", "deny suicidal thoughts", "denies suicidal thoughts"):
         hits.append("possible self-harm crisis")
 
     if has_phrase(
@@ -811,6 +822,9 @@ def detect_red_flags(text: str) -> List[str]:
         "swollen throat",
         "throat swelling",
         "anaphylaxis",
+        "throat closing",
+        "my throat is closing",
+        "airway swelling",
     ) or (has_all_words("tongue", "swollen") or has_all_words("throat", "swollen")):
         hits.append("possible anaphylaxis/allergic emergency")
 
@@ -821,13 +835,127 @@ def detect_red_flags(text: str) -> List[str]:
         "lost consciousness",
         "blackout",
         "blacked out",
+        "syncope",
     ):
         hits.append("possible loss-of-consciousness concern")
+
+    if has_phrase(
+        "seizure",
+        "convulsion",
+        "tonic clonic",
+        "shaking episode",
+        "postictal",
+    ):
+        hits.append("possible seizure emergency")
+
+    if has_phrase(
+        "hematemesis",
+        "hemoptysis",
+        "coughing up blood",
+        "black tarry stool",
+        "melena",
+        "bright red blood per rectum",
+    ):
+        hits.append("possible severe bleeding")
 
     # Preserve order but deduplicate in case of overlapping rules.
     if hits:
         hits = list(dict.fromkeys(hits))
     return hits
+
+
+def build_ui_actions(red_flags: List[str], doctor_note: Optional[str], ok: bool, error: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Web-UI friendly action metadata.
+    """
+    severity = "routine"
+    if red_flags:
+        severity = "urgent"
+    if any("self-harm" in f or "seizure" in f for f in red_flags):
+        severity = "emergency"
+    if not ok:
+        severity = "error"
+
+    actions = [
+        {"id": "submit_followup", "label": "Submit Follow-up", "style": "primary", "enabled": ok},
+        {"id": "export_visit", "label": "Export Visit JSON", "style": "secondary", "enabled": True},
+        {"id": "show_notes", "label": "Show Recent Notes", "style": "secondary", "enabled": True},
+    ]
+
+    if severity in {"urgent", "emergency"}:
+        actions.insert(0, {"id": "seek_urgent_care", "label": "Urgent Care Guidance", "style": "danger", "enabled": True})
+    if any("self-harm" in f for f in red_flags):
+        actions.insert(0, {"id": "crisis_resources", "label": "Crisis Resources", "style": "danger", "enabled": True})
+    if not ok:
+        actions.insert(0, {"id": "retry", "label": "Retry", "style": "warning", "enabled": True})
+
+    hints = []
+    if doctor_note:
+        hints.append("Display doctor note in a collapsible card.")
+    if red_flags:
+        hints.append("Pin emergency guidance at the top of the UI.")
+    if error:
+        hints.append("Offer host switch (/sethost equivalent) in settings UI.")
+
+    return {
+        "severity": severity,
+        "actions": actions,
+        "hints": hints,
+    }
+
+
+def run_hypothetical_red_flag_suite() -> Dict[str, Any]:
+    """
+    25-case detector benchmark: 20 common + 5 rare/edge cases.
+    """
+    cases = [
+        {"name": "Mild cold", "text": "Runny nose and mild cough for two days.", "expect": []},
+        {"name": "Chest pain with dyspnea", "text": "I have chest pain and shortness of breath.", "expect": ["possible chest pain emergency", "possible breathing emergency"]},
+        {"name": "Crushing chest pressure", "text": "Crushing pain and pressure in my chest.", "expect": ["possible chest pain emergency"]},
+        {"name": "Trouble breathing", "text": "I am having trouble breathing right now.", "expect": ["possible breathing emergency"]},
+        {"name": "Hard to breathe", "text": "It is hard to breathe and I am breathless.", "expect": ["possible breathing emergency"]},
+        {"name": "Stroke phrase", "text": "My father has facial droop and slurred speech.", "expect": ["possible stroke symptoms"]},
+        {"name": "One-sided weakness", "text": "Sudden weakness on one side of my body.", "expect": ["possible stroke symptoms"]},
+        {"name": "Heavy bleeding", "text": "There is heavy bleeding that won't stop.", "expect": ["possible severe bleeding"]},
+        {"name": "Vomiting blood", "text": "I am vomiting blood.", "expect": ["possible severe bleeding"]},
+        {"name": "Coughing blood", "text": "I am coughing up blood.", "expect": ["possible severe bleeding"]},
+        {"name": "Self-harm direct", "text": "I want to die and harm myself.", "expect": ["possible self-harm crisis"]},
+        {"name": "Self-harm indirect", "text": "I do not want to wake up tomorrow.", "expect": ["possible self-harm crisis"]},
+        {"name": "Anaphylaxis phrase", "text": "My tongue feels swollen and my throat is closing.", "expect": ["possible anaphylaxis/allergic emergency"]},
+        {"name": "Throat swelling", "text": "I have throat swelling after peanuts.", "expect": ["possible anaphylaxis/allergic emergency"]},
+        {"name": "Syncope", "text": "I blacked out and lost consciousness in the shower.", "expect": ["possible loss-of-consciousness concern"]},
+        {"name": "Seizure wording", "text": "He had a seizure and postictal confusion.", "expect": ["possible seizure emergency"]},
+        {"name": "Negated chest pain", "text": "No chest pain, only mild nausea.", "expect": []},
+        {"name": "Negated suicidality", "text": "I am not suicidal but I feel stressed.", "expect": []},
+        {"name": "Syncope medical term", "text": "Episode of syncope after standing.", "expect": ["possible loss-of-consciousness concern"]},
+        {"name": "No red flags GI", "text": "Stomach ache after spicy food.", "expect": []},
+
+        # Rare / hard-to-detect edge cases
+        {"name": "Rare: hematemesis", "text": "Possible hematemesis after alcohol use.", "expect": ["possible severe bleeding"]},
+        {"name": "Rare: hemoptysis", "text": "New hemoptysis with chest discomfort.", "expect": ["possible severe bleeding"]},
+        {"name": "Rare: melena", "text": "Black tarry stool for two days.", "expect": ["possible severe bleeding"]},
+        {"name": "Rare: tonic-clonic", "text": "Witnessed tonic clonic event at home.", "expect": ["possible seizure emergency"]},
+        {"name": "Rare: BRBPR", "text": "Bright red blood per rectum this morning.", "expect": ["possible severe bleeding"]},
+    ]
+
+    rows = []
+    for c in cases:
+        got = detect_red_flags(c["text"])
+        missing = [e for e in c["expect"] if e not in got]
+        rows.append({
+            "name": c["name"],
+            "ok": len(missing) == 0,
+            "expected": c["expect"],
+            "got": got,
+            "missing_expected": missing,
+        })
+
+    summary = {
+        "cases": len(rows),
+        "passes": sum(1 for r in rows if r["ok"]),
+        "fails": sum(1 for r in rows if not r["ok"]),
+    }
+    return {"summary": summary, "rows": rows}
 
 
 def save_visit_log(path: str, turns: List[Dict[str, Any]]) -> str:
@@ -910,6 +1038,19 @@ def main():
 
         if user_input == "/stats":
             safe_print(json.dumps(get_api_stats_snapshot(), indent=2))
+            continue
+
+        if user_input == "/runtests":
+            rep = run_hypothetical_red_flag_suite()
+            safe_print("\nBuilt-in 25-case safety suite:")
+            safe_print(json.dumps(rep["summary"], indent=2))
+            failed = [r for r in rep.get("rows", []) if not r.get("ok")]
+            if failed:
+                safe_print("Failed cases:")
+                for row in failed[:10]:
+                    safe_print(f" - {row.get('name')}: missing={row.get('missing_expected')}, got={row.get('got')}")
+            else:
+                safe_print("All cases passed.")
             continue
 
         # ---- diagnostics commands ----
