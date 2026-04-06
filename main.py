@@ -21,11 +21,11 @@ import sys
 import time
 import json
 import threading
-import re
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
+import re
 
 
 
@@ -557,88 +557,38 @@ def normalize_patient_input(s: str) -> Optional[str]:
 
 def detect_red_flags(text: str) -> List[str]:
     """
-    Keyword + phrase safety net so urgent symptoms are called out immediately.
-    Uses light normalization so wording variations still match.
+    Keyword + token matching safety net so urgent symptoms are called out immediately.
+    Uses both phrase matching and order-insensitive token matching (e.g. "tongue swollen").
     """
     t = (text or "").lower().strip()
-    normalized = re.sub(r"[^a-z0-9\s]", " ", t)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
+    t_norm = re.sub(r"[^a-z0-9\\s]", " ", t)
+    t_norm = re.sub(r"\\s+", " ", t_norm).strip()
+    text_tokens = set(t_norm.split())
 
-    def has_phrase(*phrases: str) -> bool:
-        return any(p in normalized for p in phrases)
+    def has_phrase(phrase: str) -> bool:
+        # exact phrase OR all words present regardless of order
+        p_norm = re.sub(r"[^a-z0-9\\s]", " ", phrase.lower())
+        p_norm = re.sub(r"\\s+", " ", p_norm).strip()
+        if not p_norm:
+            return False
+        if p_norm in t_norm:
+            return True
+        p_tokens = set(p_norm.split())
+        return bool(p_tokens) and p_tokens.issubset(text_tokens)
 
-    def has_all_words(*words: str) -> bool:
-        return all(w in normalized for w in words)
-
-    hits: List[str] = []
-
-    if has_phrase("chest pain", "pressure in chest", "crushing pain", "chest pressure"):
-        hits.append("possible chest pain emergency")
-
-    if has_phrase(
-        "cant breathe",
-        "cannot breathe",
-        "shortness of breath",
-        "trouble breathing",
-        "hard to breathe",
-        "difficulty breathing",
-        "breathless",
-    ) or has_all_words("shortness", "breath"):
-        hits.append("possible breathing emergency")
-
-    if has_phrase(
-        "face droop",
-        "facial droop",
-        "slurred speech",
-        "one side weak",
-        "numb on one side",
-        "sudden weakness one side",
-    ):
-        hits.append("possible stroke symptoms")
-
-    if has_phrase(
-        "heavy bleeding",
-        "wont stop bleeding",
-        "won t stop bleeding",
-        "coughing blood",
-        "vomiting blood",
-        "blood in vomit",
-    ):
-        hits.append("possible severe bleeding")
-
-    if has_phrase(
-        "suicidal",
-        "want to die",
-        "kill myself",
-        "harm myself",
-        "end my life",
-        "self harm",
-    ):
-        hits.append("possible self-harm crisis")
-
-    if has_phrase(
-        "swollen tongue",
-        "tongue swelling",
-        "tongue feels swollen",
-        "swollen throat",
-        "throat swelling",
-        "anaphylaxis",
-    ) or (has_all_words("tongue", "swollen") or has_all_words("throat", "swollen")):
-        hits.append("possible anaphylaxis/allergic emergency")
-
-    if has_phrase(
-        "fainted",
-        "passed out",
-        "unconscious",
-        "lost consciousness",
-        "blackout",
-        "blacked out",
-    ):
-        hits.append("possible loss-of-consciousness concern")
-
-    # Preserve order but deduplicate in case of overlapping rules.
-    if hits:
-        hits = list(dict.fromkeys(hits))
+    flag_keywords = {
+        "possible chest pain emergency": ["chest pain", "pressure in chest", "crushing pain"],
+        "possible breathing emergency": ["can't breathe", "cannot breathe", "shortness of breath", "trouble breathing", "breathing hard"],
+        "possible stroke symptoms": ["face droop", "slurred speech", "one side weak", "numb on one side", "sudden weakness"],
+        "possible severe bleeding": ["heavy bleeding", "won't stop bleeding", "coughing blood", "vomiting blood"],
+        "possible self-harm crisis": ["suicidal", "want to die", "kill myself", "harm myself", "end my life"],
+        "possible anaphylaxis/allergic emergency": ["swollen tongue", "tongue swollen", "swollen throat", "throat swelling", "anaphylaxis"],
+        "possible loss-of-consciousness concern": ["fainted", "passed out", "unconscious", "lost consciousness"],
+    }
+    hits = []
+    for label, kws in flag_keywords.items():
+        if any(has_phrase(k) for k in kws):
+            hits.append(label)
     return hits
 
 
