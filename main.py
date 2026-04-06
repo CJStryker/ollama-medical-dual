@@ -22,6 +22,7 @@ import time
 import json
 import threading
 import re
+from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
 from urllib import error as urlerror
@@ -50,6 +51,7 @@ FALLBACK_OLLAMA_HOSTS = [
     os.getenv("FALLBACK_OLLAMA_HOST_2", "").rstrip("/"),
 ]
 ACTIVE_OLLAMA_HOST = OLLAMA_HOST
+VISIT_DB_PATH = Path(os.getenv("VISIT_DB_PATH", "visits_db.json"))
 
 API_STATS: Dict[str, Any] = {
     "calls": 0,
@@ -569,7 +571,7 @@ class ClinicSession:
     Reusable session API for web or service integrations.
     Call process_patient_message(...) repeatedly with follow-up info.
     """
-    def __init__(self, use_spinner: bool = False):
+    def __init__(self, use_spinner: bool = False, patient_id: str = "anonymous"):
         self.nurse = Agent(
             name="Zesty (Nurse)",
             model=DEFAULT_NURSE_MODEL,
@@ -595,6 +597,42 @@ class ClinicSession:
             use_spinner=use_spinner,
         )
         self.visit_turns: List[Dict[str, Any]] = []
+        self.patient_id = (patient_id or "anonymous").strip()
+        self.case_snapshot: Dict[str, Any] = {
+            "started_at": datetime.utcnow().isoformat() + "Z",
+            "patient_id": self.patient_id,
+            "latest_red_flags": [],
+            "symptom_updates": [],
+        }
+
+    def set_patient_id(self, patient_id: str) -> None:
+        self.patient_id = (patient_id or "anonymous").strip()
+        self.case_snapshot["patient_id"] = self.patient_id
+
+    def get_previous_records(self, limit: int = 5) -> List[Dict[str, Any]]:
+        return find_patient_records(self.patient_id, limit=limit)
+
+    def get_case_summary(self) -> Dict[str, Any]:
+        return {
+            "patient_id": self.patient_id,
+            "turn_count": len(self.visit_turns),
+            "latest_red_flags": self.case_snapshot.get("latest_red_flags") or [],
+            "recent_symptom_updates": (self.case_snapshot.get("symptom_updates") or [])[-5:],
+            "latest_models": {
+                "nurse": self.nurse.model,
+                "doctor": self.doctor.model,
+            },
+        }
+
+    def persist_visit_to_db(self) -> Dict[str, Any]:
+        record = {
+            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "patient_id": self.patient_id,
+            "case_summary": self.get_case_summary(),
+            "turns": self.visit_turns,
+        }
+        append_visit_db(record)
+        return record
 
     def process_patient_message(self, user_text: str) -> Dict[str, Any]:
         patient_text = normalize_patient_input(user_text)
@@ -609,6 +647,12 @@ class ClinicSession:
 
         red_flags = detect_red_flags(patient_text)
         doctor_note = None
+        self.case_snapshot["latest_red_flags"] = red_flags
+        self.case_snapshot["symptom_updates"].append({
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "text": patient_text,
+            "red_flags": red_flags,
+        })
 
         try:
             self.nurse.receive("user", patient_text)
@@ -649,6 +693,9 @@ class ClinicSession:
                 "nurse_followup": nurse_followup,
                 "turn": turn,
                 "ui": build_ui_actions(red_flags, doctor_note=doctor_note, ok=True),
+                "case_summary": self.get_case_summary(),
+                "previous_records_count": len(self.get_previous_records(limit=20)),
+                "visit_open": True,
             }
         except Exception as e:
             ui = build_ui_actions(red_flags, doctor_note=doctor_note, ok=False, error=str(e))
@@ -679,6 +726,10 @@ def print_commands():
     safe_print("/safety <text>           → run red-flag detection on text")
     safe_print("/stats                   → show API call stats")
     safe_print("/runtests                → run built-in 25-case safety suite")
+    safe_print("/setpatient <id>         → set active patient id for record lookup")
+    safe_print("/records [id]            → show previous visits from local DB")
+    safe_print("/casesummary             → show in-memory case summary")
+    safe_print("/savevisit               → persist current visit to local DB")
     safe_print("/ping                    → quick generation test")
     safe_print("/health                  → deeper health check")
     safe_print("/debug                   → internal status")
@@ -969,6 +1020,36 @@ def save_visit_log(path: str, turns: List[Dict[str, Any]]) -> str:
     return path
 
 
+def load_visit_db() -> Dict[str, Any]:
+    if not VISIT_DB_PATH.exists():
+        return {"visits": []}
+    try:
+        with open(VISIT_DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("visits"), list):
+            return data
+    except Exception:
+        pass
+    return {"visits": []}
+
+
+def append_visit_db(record: Dict[str, Any]) -> None:
+    data = load_visit_db()
+    data["visits"].append(record)
+    with open(VISIT_DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def find_patient_records(patient_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    pid = (patient_id or "").strip()
+    if not pid:
+        return []
+    data = load_visit_db()
+    visits = data.get("visits") or []
+    matches = [v for v in visits if (v.get("patient_id") or "") == pid]
+    return matches[-max(1, limit):]
+
+
 # =====================
 # MAIN
 # =====================
@@ -981,6 +1062,7 @@ def main():
     safe_print("\n=== Clinic Roleplay Engine (Patient ↔ Nurse Zesty ↔ Doctor Scarlett) ===\n")
     safe_print("You are the patient. Describe what brings you in today.\n")
     safe_print("Tip: If Ollama ever stalls, try /health or /models.\n")
+    safe_print(f"Active patient id: {session.patient_id}")
     safe_print(f"Ollama host (primary): {OLLAMA_HOST}")
     safe_print(f"Ollama host candidates: {get_candidate_hosts()}\n")
 
@@ -1001,6 +1083,38 @@ def main():
 
         if user_input == "/help":
             print_commands()
+            continue
+
+        if user_input.startswith("/setpatient "):
+            parts = user_input.split(" ", 1)
+            if len(parts) != 2 or not parts[1].strip():
+                safe_print("Usage: /setpatient <id>")
+                continue
+            session.set_patient_id(parts[1].strip())
+            safe_print(f"Active patient id set to: {session.patient_id}")
+            continue
+
+        if user_input.startswith("/records"):
+            parts = user_input.split(" ", 1)
+            lookup_id = parts[1].strip() if len(parts) == 2 and parts[1].strip() else session.patient_id
+            records = find_patient_records(lookup_id, limit=5)
+            safe_print(f"Previous records for patient '{lookup_id}': {len(records)}")
+            for idx, rec in enumerate(records, 1):
+                summ = rec.get("case_summary") or {}
+                safe_print(
+                    f"{idx}. saved_at={rec.get('saved_at')} turns={summ.get('turn_count')} flags={summ.get('latest_red_flags')}"
+                )
+            continue
+
+        if user_input == "/casesummary":
+            safe_print(json.dumps(session.get_case_summary(), indent=2))
+            continue
+
+        if user_input == "/savevisit":
+            rec = session.persist_visit_to_db()
+            safe_print(
+                f"Saved visit for patient '{rec.get('patient_id')}' with {len(rec.get('turns') or [])} turns to {VISIT_DB_PATH}"
+            )
             continue
 
         if user_input == "/host":
