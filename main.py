@@ -21,11 +21,11 @@ import sys
 import time
 import json
 import threading
+import re
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
-import re
 
 
 
@@ -45,6 +45,20 @@ FALLBACK_MODELS = [
 
 # Hardcoded default host so the app works without local Ollama setup.
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://96.242.172.92:11434").rstrip("/")
+FALLBACK_OLLAMA_HOSTS = [
+    os.getenv("FALLBACK_OLLAMA_HOST_1", "http://127.0.0.1:11434").rstrip("/"),
+    os.getenv("FALLBACK_OLLAMA_HOST_2", "").rstrip("/"),
+]
+ACTIVE_OLLAMA_HOST = OLLAMA_HOST
+
+API_STATS: Dict[str, Any] = {
+    "calls": 0,
+    "success": 0,
+    "fail": 0,
+    "latency_ms_total": 0.0,
+    "last_error": None,
+    "last_host": None,
+}
 
 
 # =====================
@@ -152,45 +166,118 @@ class Spinner:
 # =====================
 
 def _ollama_api_post(path: str, payload: Dict[str, Any], timeout_s: int = 60) -> Dict[str, Any]:
-    url = f"{OLLAMA_HOST}{path}"
-    data = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
-            raw = resp.read().decode("utf-8")
-    except urlerror.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-        raise RuntimeError(f"HTTP {e.code} from {url}: {detail}") from e
-    except urlerror.URLError as e:
-        raise RuntimeError(f"Failed connecting to {url}: {e}") from e
+    last_err: Optional[Exception] = None
+    for host in get_candidate_hosts():
+        url = f"{host}{path}"
+        t0 = time.perf_counter()
+        data = json.dumps(payload).encode("utf-8")
+        req = urlrequest.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+                raw = resp.read().decode("utf-8")
+            _record_api_stat(ok=True, latency_ms=(time.perf_counter() - t0) * 1000, host=host)
+            _set_active_host(host)
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"Invalid JSON from {url}: {raw[:200]}") from e
+        except urlerror.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+            last_err = RuntimeError(f"HTTP {e.code} from {url}: {detail}")
+        except urlerror.URLError as e:
+            last_err = RuntimeError(f"Failed connecting to {url}: {e}")
+        except Exception as e:
+            last_err = e
 
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Invalid JSON from {url}: {raw[:200]}") from e
+        _record_api_stat(ok=False, latency_ms=(time.perf_counter() - t0) * 1000, host=host, err=last_err)
+        continue
+
+    raise last_err if last_err else RuntimeError("No Ollama host candidates available.")
 
 
 def _ollama_api_get(path: str, timeout_s: int = 30) -> Dict[str, Any]:
-    url = f"{OLLAMA_HOST}{path}"
-    req = urlrequest.Request(url, method="GET")
-    try:
-        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
-            raw = resp.read().decode("utf-8")
-    except urlerror.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-        raise RuntimeError(f"HTTP {e.code} from {url}: {detail}") from e
-    except urlerror.URLError as e:
-        raise RuntimeError(f"Failed connecting to {url}: {e}") from e
+    last_err: Optional[Exception] = None
+    for host in get_candidate_hosts():
+        url = f"{host}{path}"
+        t0 = time.perf_counter()
+        req = urlrequest.Request(url, method="GET")
+        try:
+            with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+                raw = resp.read().decode("utf-8")
+            _record_api_stat(ok=True, latency_ms=(time.perf_counter() - t0) * 1000, host=host)
+            _set_active_host(host)
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"Invalid JSON from {url}: {raw[:200]}") from e
+        except urlerror.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+            last_err = RuntimeError(f"HTTP {e.code} from {url}: {detail}")
+        except urlerror.URLError as e:
+            last_err = RuntimeError(f"Failed connecting to {url}: {e}")
+        except Exception as e:
+            last_err = e
 
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Invalid JSON from {url}: {raw[:200]}") from e
+        _record_api_stat(ok=False, latency_ms=(time.perf_counter() - t0) * 1000, host=host, err=last_err)
+        continue
+
+    raise last_err if last_err else RuntimeError("No Ollama host candidates available.")
+
+
+def get_candidate_hosts() -> List[str]:
+    hosts = [OLLAMA_HOST] + FALLBACK_OLLAMA_HOSTS
+    seen = set()
+    cleaned = []
+    for h in hosts:
+        hh = (h or "").strip().rstrip("/")
+        if not hh or hh in seen:
+            continue
+        seen.add(hh)
+        cleaned.append(hh)
+    return cleaned
+
+
+def _set_active_host(host: str):
+    global ACTIVE_OLLAMA_HOST
+    ACTIVE_OLLAMA_HOST = host
+
+
+def _record_api_stat(ok: bool, latency_ms: float, host: str, err: Optional[Exception] = None):
+    API_STATS["calls"] += 1
+    API_STATS["latency_ms_total"] += max(0.0, float(latency_ms))
+    API_STATS["last_host"] = host
+    if ok:
+        API_STATS["success"] += 1
+    else:
+        API_STATS["fail"] += 1
+        API_STATS["last_error"] = str(err) if err else "unknown"
+
+
+def set_ollama_host(host: str):
+    global OLLAMA_HOST
+    h = (host or "").strip().rstrip("/")
+    if not h.startswith("http://") and not h.startswith("https://"):
+        raise ValueError("Host must start with http:// or https://")
+    OLLAMA_HOST = h
+    _set_active_host(h)
+
+
+def get_api_stats_snapshot() -> Dict[str, Any]:
+    calls = API_STATS["calls"]
+    avg_ms = (API_STATS["latency_ms_total"] / calls) if calls else 0.0
+    return {
+        "calls": calls,
+        "success": API_STATS["success"],
+        "fail": API_STATS["fail"],
+        "avg_latency_ms": round(avg_ms, 2),
+        "last_host": API_STATS["last_host"],
+        "last_error": API_STATS["last_error"],
+    }
 
 
 def _ollama_chat_worker(model: str, messages: List[Dict[str, str]], options: Dict[str, Any],
@@ -486,6 +573,10 @@ def print_commands():
     safe_print("/models                  → list local Ollama models")
     safe_print("/setmodel <agent> <name> → set a model explicitly")
     safe_print("/settimeout <sec>        → set timeout seconds (both agents)")
+    safe_print("/host                    → show configured Ollama hosts")
+    safe_print("/sethost <url>           → set primary Ollama host")
+    safe_print("/safety <text>           → run red-flag detection on text")
+    safe_print("/stats                   → show API call stats")
     safe_print("/ping                    → quick generation test")
     safe_print("/health                  → deeper health check")
     safe_print("/debug                   → internal status")
@@ -557,38 +648,89 @@ def normalize_patient_input(s: str) -> Optional[str]:
 
 def detect_red_flags(text: str) -> List[str]:
     """
-    Keyword + token matching safety net so urgent symptoms are called out immediately.
-    Uses both phrase matching and order-insensitive token matching (e.g. "tongue swollen").
+    Keyword + phrase safety net so urgent symptoms are called out immediately.
+    Uses light normalization so wording variations still match.
     """
     t = (text or "").lower().strip()
-    t_norm = re.sub(r"[^a-z0-9\\s]", " ", t)
-    t_norm = re.sub(r"\\s+", " ", t_norm).strip()
-    text_tokens = set(t_norm.split())
+    normalized = re.sub(r"[^a-z0-9\s]", " ", t)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    def has_phrase(phrase: str) -> bool:
-        # exact phrase OR all words present regardless of order
-        p_norm = re.sub(r"[^a-z0-9\\s]", " ", phrase.lower())
-        p_norm = re.sub(r"\\s+", " ", p_norm).strip()
-        if not p_norm:
-            return False
-        if p_norm in t_norm:
-            return True
-        p_tokens = set(p_norm.split())
-        return bool(p_tokens) and p_tokens.issubset(text_tokens)
+    def has_phrase(*phrases: str) -> bool:
+        return any(p in normalized for p in phrases)
 
-    flag_keywords = {
-        "possible chest pain emergency": ["chest pain", "pressure in chest", "crushing pain"],
-        "possible breathing emergency": ["can't breathe", "cannot breathe", "shortness of breath", "trouble breathing", "breathing hard"],
-        "possible stroke symptoms": ["face droop", "slurred speech", "one side weak", "numb on one side", "sudden weakness"],
-        "possible severe bleeding": ["heavy bleeding", "won't stop bleeding", "coughing blood", "vomiting blood"],
-        "possible self-harm crisis": ["suicidal", "want to die", "kill myself", "harm myself", "end my life"],
-        "possible anaphylaxis/allergic emergency": ["swollen tongue", "tongue swollen", "swollen throat", "throat swelling", "anaphylaxis"],
-        "possible loss-of-consciousness concern": ["fainted", "passed out", "unconscious", "lost consciousness"],
-    }
-    hits = []
-    for label, kws in flag_keywords.items():
-        if any(has_phrase(k) for k in kws):
-            hits.append(label)
+    def has_all_words(*words: str) -> bool:
+        return all(w in normalized for w in words)
+
+    hits: List[str] = []
+
+    no_chest_pain = has_phrase("no chest pain", "without chest pain", "denies chest pain")
+    if (not no_chest_pain) and has_phrase("chest pain", "pressure in chest", "crushing pain", "chest pressure"):
+        hits.append("possible chest pain emergency")
+
+    if has_phrase(
+        "cant breathe",
+        "cannot breathe",
+        "shortness of breath",
+        "trouble breathing",
+        "hard to breathe",
+        "difficulty breathing",
+        "breathless",
+    ) or has_all_words("shortness", "breath"):
+        hits.append("possible breathing emergency")
+
+    if has_phrase(
+        "face droop",
+        "facial droop",
+        "slurred speech",
+        "one side weak",
+        "numb on one side",
+        "sudden weakness one side",
+    ):
+        hits.append("possible stroke symptoms")
+
+    if has_phrase(
+        "heavy bleeding",
+        "wont stop bleeding",
+        "won t stop bleeding",
+        "coughing blood",
+        "vomiting blood",
+        "blood in vomit",
+    ):
+        hits.append("possible severe bleeding")
+
+    if has_phrase(
+        "suicidal",
+        "want to die",
+        "kill myself",
+        "harm myself",
+        "end my life",
+        "self harm",
+    ):
+        hits.append("possible self-harm crisis")
+
+    if has_phrase(
+        "swollen tongue",
+        "tongue swelling",
+        "tongue feels swollen",
+        "swollen throat",
+        "throat swelling",
+        "anaphylaxis",
+    ) or (has_all_words("tongue", "swollen") or has_all_words("throat", "swollen")):
+        hits.append("possible anaphylaxis/allergic emergency")
+
+    if has_phrase(
+        "fainted",
+        "passed out",
+        "unconscious",
+        "lost consciousness",
+        "blackout",
+        "blacked out",
+    ):
+        hits.append("possible loss-of-consciousness concern")
+
+    # Preserve order but deduplicate in case of overlapping rules.
+    if hits:
+        hits = list(dict.fromkeys(hits))
     return hits
 
 
@@ -635,7 +777,8 @@ def main():
     safe_print("\n=== Clinic Roleplay Engine (Patient ↔ Nurse Zesty ↔ Doctor Scarlett) ===\n")
     safe_print("You are the patient. Describe what brings you in today.\n")
     safe_print("Tip: If Ollama ever stalls, try /health or /models.\n")
-    safe_print(f"Ollama host: {OLLAMA_HOST}\n")
+    safe_print(f"Ollama host (primary): {OLLAMA_HOST}")
+    safe_print(f"Ollama host candidates: {get_candidate_hosts()}\n")
 
     visit_turns: List[Dict[str, Any]] = []
 
@@ -654,6 +797,43 @@ def main():
 
         if user_input == "/help":
             print_commands()
+            continue
+
+        if user_input == "/host":
+            safe_print(f"Primary host: {OLLAMA_HOST}")
+            safe_print(f"Active host: {ACTIVE_OLLAMA_HOST}")
+            safe_print(f"Candidates: {get_candidate_hosts()}")
+            continue
+
+        if user_input.startswith("/sethost "):
+            parts = user_input.split(" ", 1)
+            if len(parts) != 2 or not parts[1].strip():
+                safe_print("Usage: /sethost <url>")
+                continue
+            try:
+                set_ollama_host(parts[1].strip())
+                safe_print(f"Primary host updated to: {OLLAMA_HOST}")
+            except Exception as e:
+                safe_print(f"Invalid host: {e}")
+            continue
+
+        if user_input.startswith("/safety "):
+            parts = user_input.split(" ", 1)
+            check_text = parts[1].strip() if len(parts) == 2 else ""
+            if not check_text:
+                safe_print("Usage: /safety <text>")
+                continue
+            flags = detect_red_flags(check_text)
+            if flags:
+                safe_print("Red flags found:")
+                for f in flags:
+                    safe_print(f" - {f}")
+            else:
+                safe_print("No red flags detected.")
+            continue
+
+        if user_input == "/stats":
+            safe_print(json.dumps(get_api_stats_snapshot(), indent=2))
             continue
 
         # ---- diagnostics commands ----
