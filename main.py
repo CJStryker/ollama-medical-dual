@@ -13,7 +13,7 @@ Key reliability upgrades vs your original:
 
 Before running:
 - Ensure Ollama is reachable (local default or set OLLAMA_HOST env var)
-- Ensure your model names are correct (PopPooB-D / PopPooB-Pin-Yin or change below)
+- Ensure your model names are correct (PopPooB-Dr:latest / PopPooB-Nurse:latest or change below)
 """
 
 import os
@@ -32,8 +32,8 @@ from urllib import request as urlrequest
 # CONFIG
 # =====================
 
-DEFAULT_NURSE_MODEL = os.getenv("NURSE_MODEL", "PopPooB-D")
-DEFAULT_DOCTOR_MODEL = os.getenv("DOCTOR_MODEL", "PopPooB-Pin-Yin")
+DEFAULT_NURSE_MODEL = os.getenv("NURSE_MODEL", "PopPooB-Nurse:latest")
+DEFAULT_DOCTOR_MODEL = os.getenv("DOCTOR_MODEL", "PopPooB-Dr:latest")
 
 # Fallback models to try if the primary model stalls.
 # IMPORTANT: Put models you actually have installed on your Ollama server.
@@ -43,7 +43,7 @@ FALLBACK_MODELS = [
 ]
 
 # Hardcoded default host so the app works without local Ollama setup.
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://qrix.fun:11434").rstrip("/")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://96.242.172.92:11434").rstrip("/")
 
 
 # =====================
@@ -619,8 +619,6 @@ def main():
     safe_print("You are the patient. Describe what brings you in today.\n")
     safe_print("Tip: If Ollama ever stalls, try /health or /models.\n")
     safe_print(f"Ollama host: {OLLAMA_HOST}\n")
-
-    visit_turns: List[Dict[str, Any]] = []
 
     visit_turns: List[Dict[str, Any]] = []
 
