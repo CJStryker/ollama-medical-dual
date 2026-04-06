@@ -423,6 +423,7 @@ class Agent:
         timeout_s: int = 60,
         retries: int = 1,
         failover_models: Optional[List[str]] = None,
+        use_spinner: bool = True,
     ):
         self.name = name
         self.model = model
@@ -433,6 +434,7 @@ class Agent:
         self.timeout_s = timeout_s
         self.retries = retries
         self.failover_models = failover_models or []
+        self.use_spinner = use_spinner
 
         self.memory: List[str] = []
         self.mood = "neutral"
@@ -504,8 +506,10 @@ MEMORY (keep brief):
         self.messages = system + rest
 
     def respond(self, phase_label: str = "generating") -> str:
-        spinner = Spinner(label=f"{self.name} {phase_label}")
-        spinner.start()
+        spinner: Optional[Spinner] = None
+        if self.use_spinner:
+            spinner = Spinner(label=f"{self.name} {phase_label}")
+            spinner.start()
 
         try:
             models_to_try = [self.model] + [m for m in self.failover_models if m and m != self.model]
@@ -526,7 +530,8 @@ MEMORY (keep brief):
             self.model = used
 
         finally:
-            spinner.stop()
+            if spinner:
+                spinner.stop()
 
         self.messages.append({"role": "assistant", "content": text})
         self._trim_history()
@@ -557,6 +562,97 @@ def consult_doctor(doctor: Agent, patient_message: str, nurse_reply: str) -> str
 
 def nurse_update_from_doctor(nurse: Agent, doctor_note: str) -> None:
     nurse.receive("user", "DOCTOR (Scarlett) guidance for you:\n" + doctor_note)
+
+
+class ClinicSession:
+    """
+    Reusable session API for web or service integrations.
+    Call process_patient_message(...) repeatedly with follow-up info.
+    """
+    def __init__(self, use_spinner: bool = False):
+        self.nurse = Agent(
+            name="Zesty (Nurse)",
+            model=DEFAULT_NURSE_MODEL,
+            system_prompt=ZESTY_PROMPT,
+            temperature=0.65,
+            max_history=18,
+            max_memory=20,
+            timeout_s=60,
+            retries=1,
+            failover_models=FALLBACK_MODELS,
+            use_spinner=use_spinner,
+        )
+        self.doctor = Agent(
+            name="Scarlett (Doctor)",
+            model=DEFAULT_DOCTOR_MODEL,
+            system_prompt=SCARLETT_PROMPT,
+            temperature=0.55,
+            max_history=12,
+            max_memory=12,
+            timeout_s=60,
+            retries=1,
+            failover_models=FALLBACK_MODELS,
+            use_spinner=use_spinner,
+        )
+        self.visit_turns: List[Dict[str, Any]] = []
+
+    def process_patient_message(self, user_text: str) -> Dict[str, Any]:
+        patient_text = normalize_patient_input(user_text)
+        if not patient_text:
+            return {
+                "ok": False,
+                "error": "Input too short/low information. Ask user for one complete sentence.",
+                "red_flags": [],
+            }
+
+        red_flags = detect_red_flags(patient_text)
+        doctor_note = None
+
+        try:
+            self.nurse.receive("user", patient_text)
+            nurse_reply = self.nurse.respond(phase_label="triaging")
+
+            try:
+                doctor_note = consult_doctor(self.doctor, patient_message=patient_text, nurse_reply=nurse_reply)
+                nurse_update_from_doctor(self.nurse, doctor_note)
+            except Exception as e:
+                doctor_note = f"Doctor consult unavailable: {e}"
+                self.nurse.receive(
+                    "user",
+                    "Doctor is unavailable. Continue safely: ask red-flag questions and give general guidance.",
+                )
+
+            self.nurse.receive("user", "Now respond to the patient. Be clear and ask the next 1–3 questions if needed.")
+            nurse_followup = self.nurse.respond(phase_label="follow-up")
+
+            turn = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "patient": patient_text,
+                "red_flags": red_flags,
+                "nurse_initial": nurse_reply,
+                "doctor_note": doctor_note,
+                "nurse_followup": nurse_followup,
+                "models": {
+                    "nurse": self.nurse.model,
+                    "doctor": self.doctor.model,
+                },
+            }
+            self.visit_turns.append(turn)
+
+            return {
+                "ok": True,
+                "red_flags": red_flags,
+                "nurse_initial": nurse_reply,
+                "doctor_note": doctor_note,
+                "nurse_followup": nurse_followup,
+                "turn": turn,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": str(e),
+                "red_flags": red_flags,
+            }
 
 
 # =====================
@@ -750,29 +846,9 @@ def save_visit_log(path: str, turns: List[Dict[str, Any]]) -> str:
 # =====================
 
 def main():
-    nurse = Agent(
-        name="Zesty (Nurse)",
-        model=DEFAULT_NURSE_MODEL,
-        system_prompt=ZESTY_PROMPT,
-        temperature=0.65,
-        max_history=18,
-        max_memory=20,
-        timeout_s=60,
-        retries=1,
-        failover_models=FALLBACK_MODELS,
-    )
-
-    doctor = Agent(
-        name="Scarlett (Doctor)",
-        model=DEFAULT_DOCTOR_MODEL,
-        system_prompt=SCARLETT_PROMPT,
-        temperature=0.55,
-        max_history=12,
-        max_memory=12,
-        timeout_s=60,
-        retries=1,
-        failover_models=FALLBACK_MODELS,
-    )
+    session = ClinicSession(use_spinner=True)
+    nurse = session.nurse
+    doctor = session.doctor
 
     safe_print("\n=== Clinic Roleplay Engine (Patient ↔ Nurse Zesty ↔ Doctor Scarlett) ===\n")
     safe_print("You are the patient. Describe what brings you in today.\n")
@@ -780,7 +856,7 @@ def main():
     safe_print(f"Ollama host (primary): {OLLAMA_HOST}")
     safe_print(f"Ollama host candidates: {get_candidate_hosts()}\n")
 
-    visit_turns: List[Dict[str, Any]] = []
+    visit_turns = session.visit_turns
 
     while True:
         print_commands()
@@ -1026,49 +1102,21 @@ def main():
                 safe_print(f" - {rf}")
             safe_print("If symptoms are severe or worsening, seek urgent/emergency care now.")
 
-        try:
-            # 1) Patient -> Nurse
-            nurse.receive("user", patient_text)
-            nurse_reply = nurse.respond(phase_label="triaging")
-            safe_print(f"\n[{nurse.name}] {nurse_reply}")
-
-            # 2) Nurse -> Doctor (optional; if it fails, keep going nurse-only)
-            doctor_note = None
-            try:
-                doctor_note = consult_doctor(doctor, patient_message=patient_text, nurse_reply=nurse_reply)
-                safe_print(f"\n[{doctor.name}] {doctor_note}")
-                nurse_update_from_doctor(nurse, doctor_note)
-            except Exception as e:
-                safe_print(f"\n[warn] Doctor consult unavailable: {e}")
-                nurse.receive("user", "Doctor is unavailable. Continue safely: ask red-flag questions and give general guidance.")
-
-            # 3) Nurse follow-up to patient
-            nurse.receive("user", "Now respond to the patient. Be clear and ask the next 1–3 questions if needed.")
-            nurse_followup = nurse.respond(phase_label="follow-up")
-            safe_print(f"\n[{nurse.name}] {nurse_followup}")
-
-            visit_turns.append({
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "patient": patient_text,
-                "red_flags": red_flags,
-                "nurse_initial": nurse_reply,
-                "doctor_note": doctor_note,
-                "nurse_followup": nurse_followup,
-                "models": {
-                    "nurse": nurse.model,
-                    "doctor": doctor.model,
-                }
-            })
-
-        except TimeoutError as te:
-            safe_print(f"\n[error] Model call timed out: {te}")
-            safe_print("Try /health. If nothing responds, restart the Ollama service or switch to a smaller model (/setmodel).")
-        except KeyboardInterrupt:
-            safe_print("\n(^C) Interrupted generation. Back to prompt.")
-            continue
-        except Exception as e:
-            safe_print(f"\n[error] Unexpected error: {e}")
+        result = session.process_patient_message(patient_text)
+        if not result.get("ok"):
+            err = result.get("error") or "unknown error"
+            safe_print(f"\n[error] {err}")
             safe_print("Try /debug, /health, or /compact to recover.")
+            continue
+
+        safe_print(f"\n[{nurse.name}] {result.get('nurse_initial')}")
+        doctor_note = result.get("doctor_note")
+        if doctor_note:
+            if str(doctor_note).startswith("Doctor consult unavailable:"):
+                safe_print(f"\n[warn] {doctor_note}")
+            else:
+                safe_print(f"\n[{doctor.name}] {doctor_note}")
+        safe_print(f"\n[{nurse.name}] {result.get('nurse_followup')}")
 
 if __name__ == "__main__":
     main()
