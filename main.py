@@ -655,10 +655,27 @@ class ClinicSession:
             "latest_red_flags": [],
             "symptom_updates": [],
         }
+        self.private_mode = False
+        self.specialist_mode = "General"
 
     def set_patient_id(self, patient_id: str) -> None:
         self.patient_id = (patient_id or "anonymous").strip()
         self.case_snapshot["patient_id"] = self.patient_id
+
+    def set_private_mode(self, enabled: bool) -> None:
+        self.private_mode = bool(enabled)
+
+    def set_specialist_mode(self, mode: str) -> None:
+        allowed = {"General", "Cardiology", "Mental Health", "Injury / Orthopedic"}
+        self.specialist_mode = mode if mode in allowed else "General"
+        guidance = {
+            "General": "Use broad intake questions and balanced caution.",
+            "Cardiology": "Focus on chest symptoms, exertion tolerance, palpitations, and escalation.",
+            "Mental Health": "Focus on mood, sleep, stressors, coping, and safety checks.",
+            "Injury / Orthopedic": "Focus on injury mechanism, mobility limits, swelling, and function.",
+        }[self.specialist_mode]
+        self.nurse.add_memory(f"Specialist mode: {self.specialist_mode}. {guidance}")
+        self.doctor.add_memory(f"Specialist mode: {self.specialist_mode}. {guidance}")
 
     def get_previous_records(self, limit: int = 5) -> List[Dict[str, Any]]:
         return find_patient_records(self.patient_id, limit=limit)
@@ -669,6 +686,8 @@ class ClinicSession:
             "turn_count": len(self.visit_turns),
             "latest_red_flags": self.case_snapshot.get("latest_red_flags") or [],
             "recent_symptom_updates": (self.case_snapshot.get("symptom_updates") or [])[-5:],
+            "private_mode": self.private_mode,
+            "specialist_mode": self.specialist_mode,
             "latest_models": {
                 "nurse": self.nurse.model,
                 "doctor": self.doctor.model,
@@ -676,6 +695,8 @@ class ClinicSession:
         }
 
     def persist_visit_to_db(self) -> Dict[str, Any]:
+        if self.private_mode:
+            return {"saved_at": None, "patient_id": self.patient_id, "case_summary": self.get_case_summary(), "turns": []}
         record = {
             "saved_at": datetime.utcnow().isoformat() + "Z",
             "patient_id": self.patient_id,
@@ -721,7 +742,8 @@ class ClinicSession:
                 },
                 "interrupted": True,
             }
-            self.visit_turns.append(turn)
+            if not self.private_mode:
+                self.visit_turns.append(turn)
             return {
                 "ok": True,
                 "interrupted": True,
@@ -736,6 +758,8 @@ class ClinicSession:
                 "visit_open": True,
                 "triage_card": classify_triage(red_flags, patient_text),
                 "recommended_next_input": "If safe to continue later, provide non-emergency symptom history.",
+                "private_mode": self.private_mode,
+                "specialist_mode": self.specialist_mode,
             }
 
         try:
@@ -767,7 +791,8 @@ class ClinicSession:
                     "doctor": self.doctor.model,
                 },
             }
-            self.visit_turns.append(turn)
+            if not self.private_mode:
+                self.visit_turns.append(turn)
 
             return {
                 "ok": True,
@@ -782,6 +807,8 @@ class ClinicSession:
                 "visit_open": True,
                 "triage_card": classify_triage(red_flags, patient_text),
                 "recommended_next_input": "Add follow-up details: onset, severity, triggers, and prior episodes.",
+                "private_mode": self.private_mode,
+                "specialist_mode": self.specialist_mode,
             }
         except Exception as e:
             ui = build_ui_actions(red_flags, doctor_note=doctor_note, ok=False, error=str(e))
@@ -1046,21 +1073,71 @@ def classify_triage(red_flags: List[str], text: str) -> Dict[str, str]:
     Final triage card for UI surfaces.
     """
     t = (text or "").lower()
+    explanation = "This is AI guidance only."
     if red_flags:
         if any(k in " ".join(red_flags) for k in ["self-harm", "seizure", "breathing", "chest pain", "stroke", "bleeding"]):
-            level = "Seek emergency care now"
+            level = "🔴 Seek Urgent Care"
+            explanation = "Potential urgent red flags were detected in your message."
         else:
-            level = "Seek urgent care today"
+            level = "🟡 Monitor / Follow-up"
+            explanation = "Some caution signals were detected; consider same-day professional evaluation."
     elif any(k in t for k in ["worse", "severe", "high fever", "persistent"]):
-        level = "Seek urgent care today"
-    elif t.strip():
-        level = "Routine appointment"
+        level = "🟡 Monitor / Follow-up"
+        explanation = "Symptoms may need closer monitoring and follow-up if they persist or worsen."
     else:
-        level = "General discussion only"
+        level = "🟢 Low Concern"
+        explanation = "No urgent red flags were detected in this simulation response."
     return {
         "level": level,
-        "label": "This is AI guidance, not a diagnosis.",
+        "explanation": explanation,
+        "label": "AI guidance only",
     }
+
+
+def render_visit_summary_text(payload: Dict[str, Any]) -> str:
+    turns = payload.get("turns") or []
+    triage = payload.get("triage_card") or {}
+    lines = [
+        "Doctor-Style Visit Summary",
+        "",
+        f"Patient ID: {payload.get('patient_id')}",
+        f"Triage: {triage.get('level')}",
+        f"Disclaimer: {triage.get('label')}",
+        "",
+    ]
+    for i, t in enumerate(turns, 1):
+        lines += [
+            f"Turn {i} ({t.get('timestamp')})",
+            f"Patient input: {t.get('patient')}",
+            f"Nurse intake: {t.get('nurse_initial')}",
+            f"Doctor note: {t.get('doctor_note')}",
+            f"Nurse follow-up: {t.get('nurse_followup')}",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def generate_simple_pdf_bytes(text: str) -> bytes:
+    safe = (text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    lines = safe.splitlines()[:120]
+    stream = "BT /F1 10 Tf 40 780 Td 12 TL " + " ".join([f"({ln[:110]}) Tj T*" for ln in lines]) + " ET"
+    objs = []
+    objs.append("1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n")
+    objs.append("2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n")
+    objs.append("3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n")
+    objs.append("4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
+    objs.append(f"5 0 obj << /Length {len(stream)} >> stream\n{stream}\nendstream endobj\n")
+    pdf = "%PDF-1.4\n"
+    offsets = []
+    for obj in objs:
+        offsets.append(len(pdf.encode("utf-8")))
+        pdf += obj
+    xref_pos = len(pdf.encode("utf-8"))
+    pdf += f"xref\n0 {len(objs)+1}\n0000000000 65535 f \n"
+    for off in offsets:
+        pdf += f"{off:010d} 00000 n \n"
+    pdf += f"trailer << /Size {len(objs)+1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF"
+    return pdf.encode("utf-8")
 
 
 def should_interrupt_for_emergency(red_flags: List[str]) -> bool:
@@ -1271,6 +1348,15 @@ def nurse_page_html() -> str:
       <h3>Roleplay intake · Patient input</h3>
       <label class="small" for="pid">Patient ID</label>
       <input id="pid" class="input" aria-label="Patient ID" placeholder="patient-123" />
+      <label class="small" for="mode" style="display:block;margin-top:8px;">Specialist mode</label>
+      <select id="mode" class="input" aria-label="Specialist mode">
+        <option>General</option>
+        <option>Cardiology</option>
+        <option>Mental Health</option>
+        <option>Injury / Orthopedic</option>
+      </select>
+      <label class="small" style="display:block;margin-top:8px;"><input id="privateMode" type="checkbox" aria-label="Private Mode (No logs saved)" /> Private Mode (No logs saved)</label>
+      <div id="privateBadge" class="small" style="display:none; color:#fda4af;">Private session active</div>
       <label class="small" for="msg" style="display:block;margin-top:8px;">Complaint / update</label>
       <textarea id="msg" aria-label="Complaint input" placeholder="Describe symptoms clearly..."></textarea>
       <div class="small" style="margin-top:8px">Include when it started, where it hurts, severity, and what makes it better or worse.</div>
@@ -1284,6 +1370,7 @@ def nurse_page_html() -> str:
         <button class="primary" id="sendBtn" aria-label="Send to clinic">Send</button>
         <button id="saveBtn" aria-label="Save visit log">Save log</button>
         <button id="exportBtn" aria-label="Export visit summary">Export summary</button>
+        <button id="continueBtn" aria-label="Continue Last Visit">Continue Last Visit</button>
         <button id="resetBtn" aria-label="Reset session">Reset session</button>
         <button class="danger" id="deleteBtn" aria-label="Delete logs">Delete logs</button>
       </div>
@@ -1317,6 +1404,7 @@ def nurse_page_html() -> str:
       <h3>AI follow-up</h3>
       <div class="status-row">
         <span class="status" id="sFollow">Follow-up ready</span>
+        <span class="status" id="sPrep">Preparing follow-up…</span>
       </div>
       <div id="followPanel" class="content empty" aria-live="polite">No AI follow-up yet. Submit intake first.</div>
       <div class="btns"><button data-copy="followPanel">Copy</button></div>
@@ -1338,6 +1426,9 @@ def nurse_page_html() -> str:
 <script>
 const pidEl = document.getElementById('pid');
 const msgEl = document.getElementById('msg');
+const modeEl = document.getElementById('mode');
+const privateEl = document.getElementById('privateMode');
+const privateBadge = document.getElementById('privateBadge');
 const nursePanel = document.getElementById('nursePanel');
 const docPanel = document.getElementById('docPanel');
 const followPanel = document.getElementById('followPanel');
@@ -1348,14 +1439,17 @@ const typingEl = document.getElementById('typing');
 const sNurse = document.getElementById('sNurse');
 const sDoctor = document.getElementById('sDoctor');
 const sFollow = document.getElementById('sFollow');
-const states = ['Idle','Collecting intake','Nurse reviewing','Doctor reviewing','Nurse follow-up ready','Visit complete'];
+const sPrep = document.getElementById('sPrep');
+const states = ['Idle','Collecting intake','Nurse reviewing…','Doctor analyzing…','Preparing follow-up…','Visit complete'];
 pidEl.value = localStorage.getItem('nurse_patient_id') || 'anonymous';
+modeEl.value = localStorage.getItem('nurse_specialist_mode') || 'General';
 
 function setState(idx){
   flowState.textContent = 'State: ' + states[Math.max(0, Math.min(states.length-1, idx))];
   sNurse.classList.toggle('active', idx === 2);
   sDoctor.classList.toggle('active', idx === 3);
-  sFollow.classList.toggle('active', idx >= 4);
+  sPrep.classList.toggle('active', idx === 4);
+  sFollow.classList.toggle('active', idx >= 5);
 }
 function setPanel(el, text){
   el.textContent = text || 'No output yet.';
@@ -1385,11 +1479,17 @@ document.getElementById('sendBtn').onclick = async () => {
   const pid = pidEl.value.trim() || 'anonymous';
   const message = msgEl.value.trim();
   if(!message){ alert('Please enter complaint/update text.'); return; }
-  localStorage.setItem('nurse_patient_id', pid);
+  const privateMode = privateEl.checked;
+  if(!privateMode){
+    localStorage.setItem('nurse_patient_id', pid);
+    localStorage.setItem('nurse_specialist_mode', modeEl.value);
+  }
   setState(1); setLoading(true);
-  const r = await fetch('/api/nurse/message', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid, message})});
+  const r = await fetch('/api/nurse/message', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid, message, private_mode: privateMode, specialist_mode: modeEl.value})});
   const j = await r.json();
-  setState(j.interrupted ? 5 : 4); setLoading(false); setState(5);
+  if(j.interrupted){ setState(5); }
+  else { setState(2); setState(3); setState(4); setState(5); }
+  setLoading(false);
   setPanel(nursePanel, j.nurse_initial);
   setPanel(docPanel, j.doctor_note);
   setPanel(followPanel, j.nurse_followup);
@@ -1400,7 +1500,9 @@ document.getElementById('sendBtn').onclick = async () => {
 
 document.getElementById('saveBtn').onclick = async () => {
   const pid = pidEl.value.trim() || 'anonymous';
-  await fetch('/api/nurse/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid})});
+  const privateMode = privateEl.checked;
+  if(privateMode){ alert('Private Mode active: save is disabled.'); return; }
+  await fetch('/api/nurse/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid, private_mode: privateMode})});
   await fetchHistory();
 };
 
@@ -1410,6 +1512,28 @@ document.getElementById('exportBtn').onclick = async () => {
   const j = await r.json();
   await navigator.clipboard.writeText(JSON.stringify(j, null, 2));
   alert('Visit summary copied.');
+};
+
+document.getElementById('continueBtn').onclick = async () => {
+  const pid = pidEl.value.trim() || 'anonymous';
+  const r = await fetch('/api/nurse/continue', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid})});
+  const j = await r.json();
+  if(j.continued){
+    const last = (j.turns||[]).slice(-1)[0] || {};
+    setPanel(nursePanel, last.nurse_initial || 'Loaded previous visit context.');
+    setPanel(docPanel, last.doctor_note || 'Doctor note restored.');
+    setPanel(followPanel, last.nurse_followup || 'Follow-up restored.');
+    triageText.textContent = ((j.case_summary||{}).latest_red_flags||[]).length ? '🟡 Monitor / Follow-up' : '🟢 Low Concern';
+    alert('Last visit loaded.');
+  } else {
+    alert('No previous visit found for this patient.');
+  }
+};
+
+document.getElementById('triageCard').insertAdjacentHTML('beforeend','<div class=\"btns\" style=\"margin-top:10px\"><button id=\"pdfBtn\" aria-label=\"Download PDF summary\">Download PDF</button></div>');
+document.getElementById('pdfBtn').onclick = async () => {
+  const pid = pidEl.value.trim() || 'anonymous';
+  window.location.href = '/api/nurse/export.pdf?patient_id=' + encodeURIComponent(pid);
 };
 
 document.getElementById('resetBtn').onclick = async () => {
@@ -1427,6 +1551,14 @@ document.getElementById('deleteBtn').onclick = async () => {
   await fetch('/api/nurse/history?patient_id=' + encodeURIComponent(pid), {method:'DELETE'});
   await fetchHistory();
 };
+
+privateEl.addEventListener('change', () => {
+  privateBadge.style.display = privateEl.checked ? 'block' : 'none';
+  if(privateEl.checked){
+    localStorage.removeItem('nurse_patient_id');
+    localStorage.removeItem('nurse_specialist_mode');
+  }
+});
 
 document.querySelectorAll('button[data-copy]').forEach(btn => btn.onclick = async () => {
   const id = btn.getAttribute('data-copy');
@@ -1455,6 +1587,8 @@ def create_web_app() -> Any:
         pid = (body.get("patient_id") or "anonymous").strip()
         msg = body.get("message") or ""
         s = get_or_create_session(pid)
+        s.set_private_mode(bool(body.get("private_mode")))
+        s.set_specialist_mode(body.get("specialist_mode") or "General")
         out = s.process_patient_message(msg)
         return jsonify(out), HTTPStatus.OK
 
@@ -1463,6 +1597,7 @@ def create_web_app() -> Any:
         body = request.get_json(force=True, silent=True) or {}
         pid = (body.get("patient_id") or "anonymous").strip()
         s = get_or_create_session(pid)
+        s.set_private_mode(bool(body.get("private_mode")))
         rec = s.persist_visit_to_db()
         return jsonify({"ok": True, "record": rec}), HTTPStatus.OK
 
@@ -1492,7 +1627,7 @@ def create_web_app() -> Any:
     def api_export():
         pid = (request.args.get("patient_id") or "anonymous").strip()
         s = get_or_create_session(pid)
-        return jsonify({
+        payload = {
             "ok": True,
             "patient_id": pid,
             "case_summary": s.get_case_summary(),
@@ -1500,7 +1635,45 @@ def create_web_app() -> Any:
             "triage_card": classify_triage(s.case_snapshot.get("latest_red_flags") or [], " ".join(
                 [x.get("text") or "" for x in (s.case_snapshot.get("symptom_updates") or [])]
             )),
-        }), HTTPStatus.OK
+        }
+        return jsonify(payload), HTTPStatus.OK
+
+    @app.get("/api/nurse/export.pdf")
+    def api_export_pdf():
+        pid = (request.args.get("patient_id") or "anonymous").strip()
+        s = get_or_create_session(pid)
+        payload = {
+            "patient_id": pid,
+            "case_summary": s.get_case_summary(),
+            "turns": s.visit_turns,
+            "triage_card": classify_triage(s.case_snapshot.get("latest_red_flags") or [], " ".join(
+                [x.get("text") or "" for x in (s.case_snapshot.get("symptom_updates") or [])]
+            )),
+        }
+        pdf = generate_simple_pdf_bytes(render_visit_summary_text(payload))
+        return Response(pdf, status=HTTPStatus.OK, mimetype="application/pdf", headers={
+            "Content-Disposition": f"attachment; filename=visit_summary_{pid}.pdf"
+        })
+
+    @app.post("/api/nurse/continue")
+    def api_continue():
+        body = request.get_json(force=True, silent=True) or {}
+        pid = (body.get("patient_id") or "anonymous").strip()
+        recs = find_patient_records(pid, limit=1)
+        s = get_or_create_session(pid)
+        if recs:
+            last = recs[-1]
+            s.visit_turns = list(last.get("turns") or [])
+            s.case_snapshot["latest_red_flags"] = (last.get("case_summary") or {}).get("latest_red_flags") or []
+            s.case_snapshot["symptom_updates"] = []
+            for t in s.visit_turns:
+                s.case_snapshot["symptom_updates"].append({
+                    "timestamp": t.get("timestamp"),
+                    "text": t.get("patient"),
+                    "red_flags": t.get("red_flags") or [],
+                })
+            return jsonify({"ok": True, "continued": True, "turns": s.visit_turns, "case_summary": s.get_case_summary()}), HTTPStatus.OK
+        return jsonify({"ok": True, "continued": False, "turns": [], "case_summary": s.get_case_summary()}), HTTPStatus.OK
 
     return app
 
