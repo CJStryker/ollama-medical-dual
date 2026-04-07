@@ -27,6 +27,15 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
+from http import HTTPStatus
+
+try:
+    from flask import Flask, jsonify, request, Response
+except Exception:
+    Flask = None
+    jsonify = None
+    request = None
+    Response = None
 
 
 
@@ -69,22 +78,28 @@ API_STATS: Dict[str, Any] = {
 
 ZESTY_PROMPT = """
 IDENTITY:
-You are Zesty, a registered nurse in a clinic. You speak in first person and refer to yourself as "I".
+You are Zesty, a roleplay intake nurse persona in an educational simulation. You speak in first person and refer to yourself as "I".
 
 TEAM:
 Scarlett is the supervising doctor. You trust her clinical judgment and follow her guidance.
 
 ROLE:
 - You speak directly to the patient (the user).
-- You gather history, symptoms, vitals (if provided), meds/allergies, and relevant context.
+- You gather history, symptoms, severity, timeline, vitals (if provided), meds/allergies, and relevant context.
 - You ask clear follow-up questions, one at a time when possible.
 - You summarize concisely and then consult Scarlett when needed.
+- You must use uncertainty language like "could" and "might".
 
 BOUNDARIES:
 - No explicit sexual content.
 - No graphic violence.
 - Do not provide unsafe instructions.
-- If symptoms suggest emergency (chest pain, severe trouble breathing, stroke signs, fainting, severe bleeding, suicidal intent), advise urgent emergency care.
+- Do not claim to be a real nurse or doctor.
+- Do not diagnose conditions.
+- Do not prescribe medications or dosages.
+- Never say "you are fine".
+- Never override real-world professional medical advice.
+- If symptoms suggest emergency (chest pain, severe trouble breathing, stroke signs, fainting, severe bleeding, seizure, suicidal intent, overdose, allergic airway reaction), advise urgent emergency care.
 
 STYLE:
 - Calm, professional, empathetic.
@@ -93,16 +108,18 @@ STYLE:
 
 IMPORTANT:
 You are participating in an ongoing roleplay where the user is the patient.
+Always remind users this is educational roleplay and not medical advice.
 """
 
 SCARLETT_PROMPT = """
 IDENTITY:
-You are Scarlett, a physician (doctor) supervising Zesty. You speak in first person.
+You are Scarlett, a doctor-style persona supervising Zesty in educational roleplay. You speak in first person.
 
 ROLE:
 - You advise Nurse Zesty based on the presented patient information.
 - You help decide what questions to ask next and what safe, general guidance to provide.
 - You emphasize red flags and when to escalate to urgent care.
+- You must use uncertainty language like "could" and "might".
 
 OUTPUT FORMAT (IMPORTANT):
 Always respond as a brief "Doctor Note" to Zesty:
@@ -116,9 +133,15 @@ BOUNDARIES:
 - No explicit sexual content.
 - No graphic violence.
 - Do not provide unsafe instructions.
+- Do not claim to be a real doctor.
+- Do not diagnose conditions.
+- Do not prescribe medications or dosages.
+- Never say "you are fine".
+- Never override real-world professional medical advice.
 - If emergency red flags present, recommend urgent evaluation.
 
 You are participating in an ongoing roleplay.
+Always remind users this is educational roleplay and not medical advice.
 """
 
 
@@ -654,6 +677,42 @@ class ClinicSession:
             "red_flags": red_flags,
         })
 
+        # Safety-first interruption: do not continue roleplay on potential emergencies.
+        if should_interrupt_for_emergency(red_flags):
+            emergency_msg = (
+                "Your message may describe symptoms that need urgent care.\n"
+                "Call 911 or go to the nearest emergency room now."
+            )
+            turn = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "patient": patient_text,
+                "red_flags": red_flags,
+                "nurse_initial": emergency_msg,
+                "doctor_note": "Emergency interruption activated.",
+                "nurse_followup": emergency_msg,
+                "models": {
+                    "nurse": self.nurse.model,
+                    "doctor": self.doctor.model,
+                },
+                "interrupted": True,
+            }
+            self.visit_turns.append(turn)
+            return {
+                "ok": True,
+                "interrupted": True,
+                "red_flags": red_flags,
+                "nurse_initial": emergency_msg,
+                "doctor_note": "Emergency interruption activated.",
+                "nurse_followup": emergency_msg,
+                "turn": turn,
+                "ui": build_ui_actions(red_flags, doctor_note="Emergency interruption activated.", ok=True),
+                "case_summary": self.get_case_summary(),
+                "previous_records_count": len(self.get_previous_records(limit=20)),
+                "visit_open": True,
+                "triage_card": classify_triage(red_flags, patient_text),
+                "recommended_next_input": "If safe to continue later, provide non-emergency symptom history.",
+            }
+
         try:
             self.nurse.receive("user", patient_text)
             nurse_reply = self.nurse.respond(phase_label="triaging")
@@ -696,6 +755,8 @@ class ClinicSession:
                 "case_summary": self.get_case_summary(),
                 "previous_records_count": len(self.get_previous_records(limit=20)),
                 "visit_open": True,
+                "triage_card": classify_triage(red_flags, patient_text),
+                "recommended_next_input": "Add follow-up details: onset, severity, triggers, and prior episodes.",
             }
         except Exception as e:
             ui = build_ui_actions(red_flags, doctor_note=doctor_note, ok=False, error=str(e))
@@ -955,6 +1016,43 @@ def build_ui_actions(red_flags: List[str], doctor_note: Optional[str], ok: bool,
     }
 
 
+def classify_triage(red_flags: List[str], text: str) -> Dict[str, str]:
+    """
+    Final triage card for UI surfaces.
+    """
+    t = (text or "").lower()
+    if red_flags:
+        if any(k in " ".join(red_flags) for k in ["self-harm", "seizure", "breathing", "chest pain", "stroke", "bleeding"]):
+            level = "Seek emergency care now"
+        else:
+            level = "Seek urgent care today"
+    elif any(k in t for k in ["worse", "severe", "high fever", "persistent"]):
+        level = "Seek urgent care today"
+    elif t.strip():
+        level = "Routine appointment"
+    else:
+        level = "General discussion only"
+    return {
+        "level": level,
+        "label": "This is AI guidance, not a diagnosis.",
+    }
+
+
+def should_interrupt_for_emergency(red_flags: List[str]) -> bool:
+    emergency_tokens = (
+        "chest pain",
+        "breathing",
+        "stroke",
+        "seizure",
+        "loss-of-consciousness",
+        "self-harm",
+        "bleeding",
+        "anaphylaxis",
+    )
+    joined = " ".join(red_flags)
+    return any(tok in joined for tok in emergency_tokens)
+
+
 def run_hypothetical_red_flag_suite() -> Dict[str, Any]:
     """
     25-case detector benchmark: 20 common + 5 rare/edge cases.
@@ -1048,6 +1146,252 @@ def find_patient_records(patient_id: str, limit: int = 5) -> List[Dict[str, Any]
     visits = data.get("visits") or []
     matches = [v for v in visits if (v.get("patient_id") or "") == pid]
     return matches[-max(1, limit):]
+
+
+WEB_SESSIONS: Dict[str, ClinicSession] = {}
+
+
+def get_or_create_session(patient_id: str) -> ClinicSession:
+    pid = (patient_id or "anonymous").strip() or "anonymous"
+    if pid not in WEB_SESSIONS:
+        WEB_SESSIONS[pid] = ClinicSession(use_spinner=False, patient_id=pid)
+    return WEB_SESSIONS[pid]
+
+
+def nurse_page_html() -> str:
+    # Safety copy intentionally exact per product requirement.
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Qrix Nurse Roleplay Intake</title>
+  <style>
+    :root { --bg:#0f172a; --panel:#111827; --ink:#e5e7eb; --muted:#94a3b8; --accent:#22c55e; --warn:#f97316; --danger:#ef4444; --line:#1f2937; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Inter,system-ui,Arial,sans-serif; background:linear-gradient(180deg,#0b1220,#111827); color:var(--ink); }
+    .wrap { max-width:1100px; margin:0 auto; padding:16px; }
+    .banner { background:#7f1d1d; border:1px solid #ef4444; border-radius:12px; padding:14px; line-height:1.45; }
+    .cards { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:12px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; min-height:220px; }
+    .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.07em; }
+    .value { margin-top:6px; white-space:pre-wrap; }
+    .panel-empty { color:var(--muted); font-style:italic; }
+    .toolbar, .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+    button { background:#1f2937; color:var(--ink); border:1px solid #334155; border-radius:10px; padding:8px 12px; cursor:pointer; }
+    button.primary { background:#2563eb; border-color:#2563eb; }
+    button.danger { background:#991b1b; border-color:#dc2626; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    textarea,input { width:100%; background:#0b1220; color:var(--ink); border:1px solid #334155; border-radius:10px; padding:10px; }
+    .row { display:grid; grid-template-columns:1fr 2fr; gap:10px; margin-top:12px; }
+    .note { color:var(--muted); font-size:13px; }
+    .state { margin-top:8px; padding:8px 10px; border-radius:10px; background:#0b1220; border:1px solid #334155; }
+    .triage { margin-top:12px; border:1px solid #374151; border-radius:12px; padding:12px; background:#111827; }
+    .triage strong { color:#fbbf24; }
+    @media (max-width: 900px){ .cards { grid-template-columns:1fr; } .row { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>/nurse — Roleplay intake</h1>
+  <div class="banner" role="alert" aria-live="assertive">
+    <div>Educational roleplay only — not medical advice, diagnosis, treatment, or emergency care.</div>
+    <div>If you think you may be having a medical emergency, call 911 or go to the nearest emergency room now.</div>
+    <div>Do not use this tool for chest pain, trouble breathing, stroke symptoms, severe bleeding, seizures, suicidal thoughts, allergic reactions, overdose, or any urgent condition.</div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <div class="label">What this tool is / is not</div>
+      <div class="value"><strong>DOES:</strong><br/>- organizes symptoms into structured notes<br/>- simulates intake + doctor-style summary<br/>- asks follow-up questions<br/><br/><strong>DOES NOT:</strong><br/>- diagnose<br/>- prescribe<br/>- replace real doctors<br/>- handle emergencies<br/><br/><strong>This tool may be wrong, incomplete, or unsafe.</strong></div>
+    </div>
+    <div class="card">
+      <div class="label">Privacy + data handling</div>
+      <div class="value">Stored data includes user input, timestamps, and AI outputs.<br/>Storage location: browser localStorage (patient id + UI state) and server JSON file (visit records).<br/>Delete logs: use “Delete logs (patient)” below.<br/><br/><strong>Do not enter sensitive real-world personal information unless you understand how it is stored.</strong></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <div class="label">Visit controls</div>
+    <label for="pid">Patient ID</label>
+    <input id="pid" aria-label="Patient ID" placeholder="patient-123" />
+    <label for="msg" style="margin-top:8px; display:block;">Complaint / update</label>
+    <textarea id="msg" rows="4" aria-label="Complaint input" placeholder="Describe symptoms..."></textarea>
+    <div class="note">Include when it started, where it hurts, severity, and what makes it better or worse.</div>
+    <div class="note">Example prompts: “I’ve had a sore throat and fever for two days.” · “My stomach hurts after eating.” · “I twisted my ankle yesterday and it’s swollen.” · “I’ve been coughing all week.”</div>
+    <div class="state" id="state">State: Idle</div>
+    <div class="toolbar">
+      <button class="primary" id="sendBtn" aria-label="Send to clinic">Send to clinic</button>
+      <button id="saveBtn" aria-label="Save visit log">Save visit log</button>
+      <button id="exportBtn" aria-label="Export visit summary">Export visit summary</button>
+      <button id="resetBtn" aria-label="Reset current visit">Reset visit</button>
+      <button class="danger" id="deleteBtn" aria-label="Delete logs for patient">Delete logs (patient)</button>
+    </div>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="label">Roleplay intake</div><div id="nursePanel" class="value panel-empty">No intake yet. Submit a complaint to begin.</div><button data-copy="nursePanel">Copy</button></div>
+    <div class="card"><div class="label">Doctor-style note</div><div id="docPanel" class="value panel-empty">No doctor-style note yet.</div><button data-copy="docPanel">Copy</button></div>
+    <div class="card"><div class="label">AI follow-up</div><div id="followPanel" class="value panel-empty">No AI follow-up yet.</div><button data-copy="followPanel">Copy</button></div>
+  </div>
+
+  <div class="triage" id="triageCard"><strong>This is AI guidance, not a diagnosis.</strong><div id="triageText">General discussion only</div></div>
+  <div class="card" style="margin-top:12px;">
+    <div class="label">Visit history</div>
+    <div id="history" class="value panel-empty">No saved records yet.</div>
+  </div>
+</div>
+
+<script>
+const stateEl = document.getElementById('state');
+const pidEl = document.getElementById('pid');
+const msgEl = document.getElementById('msg');
+const nursePanel = document.getElementById('nursePanel');
+const docPanel = document.getElementById('docPanel');
+const followPanel = document.getElementById('followPanel');
+const triageText = document.getElementById('triageText');
+const historyEl = document.getElementById('history');
+const states = ['Idle','Collecting intake','Nurse reviewing','Doctor reviewing','Nurse follow-up ready','Visit complete'];
+pidEl.value = localStorage.getItem('nurse_patient_id') || 'anonymous';
+
+function setState(i){ stateEl.textContent = 'State: ' + states[Math.max(0, Math.min(states.length-1, i))]; }
+function setPanel(el, text){ el.textContent = text || 'No output yet.'; el.classList.remove('panel-empty'); }
+
+async function fetchHistory(){
+  const pid = pidEl.value.trim() || 'anonymous';
+  const r = await fetch('/api/nurse/history?patient_id=' + encodeURIComponent(pid));
+  const j = await r.json();
+  if(!j.records || !j.records.length){ historyEl.textContent = 'No saved records yet.'; historyEl.classList.add('panel-empty'); return; }
+  historyEl.classList.remove('panel-empty');
+  historyEl.textContent = j.records.map((x,i)=>`${i+1}. ${x.saved_at} | turns=${(x.case_summary||{}).turn_count} | flags=${((x.case_summary||{}).latest_red_flags||[]).join(', ')}`).join('\\n');
+}
+
+document.getElementById('sendBtn').onclick = async () => {
+  const pid = pidEl.value.trim() || 'anonymous';
+  const message = msgEl.value.trim();
+  if(!message){ alert('Please enter complaint/update text.'); return; }
+  localStorage.setItem('nurse_patient_id', pid);
+  setState(1); setState(2);
+  const r = await fetch('/api/nurse/message', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid, message})});
+  const j = await r.json();
+  if(j.interrupted){ setState(5); }
+  else { setState(3); setState(4); setState(5); }
+  setPanel(nursePanel, j.nurse_initial);
+  setPanel(docPanel, j.doctor_note);
+  setPanel(followPanel, j.nurse_followup);
+  triageText.textContent = (j.triage_card||{}).level || 'General discussion only';
+  msgEl.value = '';
+  await fetchHistory();
+};
+
+document.getElementById('saveBtn').onclick = async () => {
+  const pid = pidEl.value.trim() || 'anonymous';
+  await fetch('/api/nurse/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid})});
+  await fetchHistory();
+  alert('Visit saved.');
+};
+
+document.getElementById('resetBtn').onclick = async () => {
+  const pid = pidEl.value.trim() || 'anonymous';
+  await fetch('/api/nurse/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid})});
+  setState(0);
+  nursePanel.textContent = 'No intake yet. Submit a complaint to begin.'; nursePanel.classList.add('panel-empty');
+  docPanel.textContent = 'No doctor-style note yet.'; docPanel.classList.add('panel-empty');
+  followPanel.textContent = 'No AI follow-up yet.'; followPanel.classList.add('panel-empty');
+  triageText.textContent = 'General discussion only';
+  alert('Visit reset. You can continue by sending a new intake message.');
+};
+
+document.getElementById('deleteBtn').onclick = async () => {
+  const pid = pidEl.value.trim() || 'anonymous';
+  await fetch('/api/nurse/history?patient_id=' + encodeURIComponent(pid), {method:'DELETE'});
+  await fetchHistory();
+  alert('Deleted saved logs for patient: ' + pid);
+};
+
+document.getElementById('exportBtn').onclick = async () => {
+  const pid = pidEl.value.trim() || 'anonymous';
+  const r = await fetch('/api/nurse/export?patient_id=' + encodeURIComponent(pid));
+  const j = await r.json();
+  navigator.clipboard.writeText(JSON.stringify(j, null, 2));
+  alert('Visit summary copied to clipboard.');
+};
+
+document.querySelectorAll('button[data-copy]').forEach(btn => btn.onclick = async () => {
+  const id = btn.getAttribute('data-copy');
+  const text = document.getElementById(id).textContent || '';
+  await navigator.clipboard.writeText(text);
+  alert('Copied.');
+});
+
+fetchHistory();
+</script>
+</body></html>"""
+
+
+def create_web_app() -> Any:
+    if Flask is None:
+        raise RuntimeError("Flask is required for web mode. Install flask first.")
+    app = Flask(__name__)
+
+    @app.get("/nurse")
+    def nurse_page():
+        return Response(nurse_page_html(), status=HTTPStatus.OK, mimetype="text/html")
+
+    @app.post("/api/nurse/message")
+    def api_message():
+        body = request.get_json(force=True, silent=True) or {}
+        pid = (body.get("patient_id") or "anonymous").strip()
+        msg = body.get("message") or ""
+        s = get_or_create_session(pid)
+        out = s.process_patient_message(msg)
+        return jsonify(out), HTTPStatus.OK
+
+    @app.post("/api/nurse/save")
+    def api_save():
+        body = request.get_json(force=True, silent=True) or {}
+        pid = (body.get("patient_id") or "anonymous").strip()
+        s = get_or_create_session(pid)
+        rec = s.persist_visit_to_db()
+        return jsonify({"ok": True, "record": rec}), HTTPStatus.OK
+
+    @app.get("/api/nurse/history")
+    def api_history():
+        pid = (request.args.get("patient_id") or "anonymous").strip()
+        return jsonify({"ok": True, "records": find_patient_records(pid, limit=20)}), HTTPStatus.OK
+
+    @app.delete("/api/nurse/history")
+    def api_history_delete():
+        pid = (request.args.get("patient_id") or "anonymous").strip()
+        data = load_visit_db()
+        visits = data.get("visits") or []
+        data["visits"] = [v for v in visits if (v.get("patient_id") or "") != pid]
+        with open(VISIT_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return jsonify({"ok": True, "deleted_patient_id": pid}), HTTPStatus.OK
+
+    @app.post("/api/nurse/reset")
+    def api_reset():
+        body = request.get_json(force=True, silent=True) or {}
+        pid = (body.get("patient_id") or "anonymous").strip()
+        WEB_SESSIONS[pid] = ClinicSession(use_spinner=False, patient_id=pid)
+        return jsonify({"ok": True}), HTTPStatus.OK
+
+    @app.get("/api/nurse/export")
+    def api_export():
+        pid = (request.args.get("patient_id") or "anonymous").strip()
+        s = get_or_create_session(pid)
+        return jsonify({
+            "ok": True,
+            "patient_id": pid,
+            "case_summary": s.get_case_summary(),
+            "turns": s.visit_turns,
+            "triage_card": classify_triage(s.case_snapshot.get("latest_red_flags") or [], " ".join(
+                [x.get("text") or "" for x in (s.case_snapshot.get("symptom_updates") or [])]
+            )),
+        }), HTTPStatus.OK
+
+    return app
 
 
 # =====================
@@ -1374,4 +1718,16 @@ def main():
         safe_print(f"\n[{nurse.name}] {result.get('nurse_followup')}")
 
 if __name__ == "__main__":
-    main()
+    if "--web" in sys.argv:
+        app = create_web_app()
+        port = 8080
+        for i, a in enumerate(sys.argv):
+            if a == "--port" and i + 1 < len(sys.argv):
+                try:
+                    port = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        safe_print(f"Starting web server on http://0.0.0.0:{port}/nurse")
+        app.run(host="0.0.0.0", port=port, debug=False)
+    else:
+        main()
