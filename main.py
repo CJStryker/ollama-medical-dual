@@ -1184,91 +1184,158 @@ def get_or_create_session(patient_id: str) -> ClinicSession:
 
 
 def nurse_page_html() -> str:
-    # Safety copy intentionally exact per product requirement.
+    # Design choices:
+    # - Glassmorphism panels + soft blue/purple glows for premium dark visual hierarchy.
+    # - Responsive 3-column -> 1-column collapse for mobile.
+    # - Explicit safety framing and state indicators for trust and clarity.
     return """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Qrix Nurse Roleplay Intake</title>
+  <title>qrix.shop /nurse</title>
   <style>
-    :root { --bg:#0f172a; --panel:#111827; --ink:#e5e7eb; --muted:#94a3b8; --accent:#22c55e; --warn:#f97316; --danger:#ef4444; --line:#1f2937; }
-    * { box-sizing:border-box; }
-    body { margin:0; font-family:Inter,system-ui,Arial,sans-serif; background:linear-gradient(180deg,#0b1220,#111827); color:var(--ink); }
-    .wrap { max-width:1100px; margin:0 auto; padding:16px; }
-    .banner { background:#7f1d1d; border:1px solid #ef4444; border-radius:12px; padding:14px; line-height:1.45; }
-    .cards { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:12px; }
-    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; min-height:220px; }
-    .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.07em; }
-    .value { margin-top:6px; white-space:pre-wrap; }
-    .panel-empty { color:var(--muted); font-style:italic; }
-    .toolbar, .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
-    button { background:#1f2937; color:var(--ink); border:1px solid #334155; border-radius:10px; padding:8px 12px; cursor:pointer; }
-    button.primary { background:#2563eb; border-color:#2563eb; }
-    button.danger { background:#991b1b; border-color:#dc2626; }
-    button:disabled { opacity:.5; cursor:not-allowed; }
-    textarea,input { width:100%; background:#0b1220; color:var(--ink); border:1px solid #334155; border-radius:10px; padding:10px; }
-    .row { display:grid; grid-template-columns:1fr 2fr; gap:10px; margin-top:12px; }
-    .note { color:var(--muted); font-size:13px; }
-    .state { margin-top:8px; padding:8px 10px; border-radius:10px; background:#0b1220; border:1px solid #334155; }
-    .triage { margin-top:12px; border:1px solid #374151; border-radius:12px; padding:12px; background:#111827; }
-    .triage strong { color:#fbbf24; }
-    @media (max-width: 900px){ .cards { grid-template-columns:1fr; } .row { grid-template-columns:1fr; } }
+    :root{
+      --bg:#070b16; --bg2:#0b1020; --ink:#e6e9f5; --muted:#9ca8c7;
+      --line:rgba(255,255,255,.12); --panel:rgba(255,255,255,.06);
+      --danger:#ff5b6e; --ok:#38d39f; --accent:#7c8cff; --accent2:#9b6bff;
+      --shadow:0 10px 40px rgba(0,0,0,.35);
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0; color:var(--ink); font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Arial,sans-serif;
+      background:
+        radial-gradient(1200px 600px at -10% -10%, rgba(124,140,255,.20), transparent 60%),
+        radial-gradient(900px 500px at 110% 0%, rgba(155,107,255,.20), transparent 55%),
+        linear-gradient(180deg,var(--bg),var(--bg2));
+    }
+    .wrap{max-width:1240px;margin:0 auto;padding:18px}
+    .glass{
+      background:var(--panel); border:1px solid var(--line); border-radius:18px;
+      backdrop-filter: blur(12px); box-shadow:var(--shadow);
+    }
+    .banner{padding:14px 16px;border-color:rgba(255,91,110,.5);background:rgba(127,29,29,.35)}
+    .title{font-size:clamp(20px,2.2vw,30px); margin:0 0 8px}
+    .sub{color:var(--muted); margin:0}
+    .top{display:grid; gap:12px; margin-bottom:12px}
+    .main-grid{display:grid; grid-template-columns:1.05fr 1fr 1fr; gap:12px}
+    .panel{padding:14px; min-height:360px; animation:fade .25s ease}
+    .panel h3{margin:0 0 8px; font-size:15px; letter-spacing:.01em}
+    .small{font-size:12px; color:var(--muted)}
+    .input,textarea{width:100%; border-radius:12px; border:1px solid var(--line); background:rgba(0,0,0,.25); color:var(--ink); padding:10px}
+    textarea{min-height:130px; resize:vertical}
+    .btns{display:flex; flex-wrap:wrap; gap:8px; margin-top:10px}
+    button{
+      border:1px solid var(--line); border-radius:12px; background:rgba(255,255,255,.06); color:var(--ink);
+      padding:8px 12px; cursor:pointer; transition:.2s transform,.2s background,.2s border-color;
+    }
+    button:hover{transform:translateY(-1px); background:rgba(255,255,255,.12)}
+    button.primary{background:linear-gradient(135deg,var(--accent),var(--accent2)); border:none}
+    button.danger{background:rgba(255,91,110,.18); border-color:rgba(255,91,110,.45)}
+    .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid var(--line);font-size:12px;color:var(--muted);margin:3px 6px 0 0}
+    .example{cursor:pointer}
+    .example:hover{border-color:rgba(124,140,255,.7); color:#d7defc}
+    .content{
+      min-height:220px; border:1px solid var(--line); border-radius:14px; padding:10px;
+      background:rgba(0,0,0,.22); white-space:pre-wrap; line-height:1.42;
+    }
+    .empty{color:var(--muted); font-style:italic}
+    .status-row{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px}
+    .status{padding:6px 10px; border-radius:999px; border:1px solid var(--line); font-size:12px}
+    .status.active{color:#dff7ef; border-color:rgba(56,211,159,.55); background:rgba(56,211,159,.12)}
+    .typing{display:inline-flex; gap:4px; vertical-align:middle}
+    .typing span{width:6px;height:6px;border-radius:50%;background:#c7d2fe; animation:b 1s infinite}
+    .typing span:nth-child(2){animation-delay:.15s}.typing span:nth-child(3){animation-delay:.3s}
+    .bottom{display:grid; grid-template-columns:2fr 1fr; gap:12px; margin-top:12px}
+    .triage{padding:14px}
+    .triage strong{color:#fde68a}
+    .history{margin-top:12px; padding:12px}
+    @keyframes b{0%,80%,100%{opacity:.35;transform:translateY(0)}40%{opacity:1;transform:translateY(-2px)}}
+    @keyframes fade{from{opacity:.4; transform:translateY(3px)}to{opacity:1; transform:none}}
+    @media (max-width:1080px){.main-grid{grid-template-columns:1fr}.bottom{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>/nurse — Roleplay intake</h1>
-  <div class="banner" role="alert" aria-live="assertive">
-    <div>Educational roleplay only — not medical advice, diagnosis, treatment, or emergency care.</div>
-    <div>If you think you may be having a medical emergency, call 911 or go to the nearest emergency room now.</div>
-    <div>Do not use this tool for chest pain, trouble breathing, stroke symptoms, severe bleeding, seizures, suicidal thoughts, allergic reactions, overdose, or any urgent condition.</div>
-  </div>
-
-  <div class="row">
-    <div class="card">
-      <div class="label">What this tool is / is not</div>
-      <div class="value"><strong>DOES:</strong><br/>- organizes symptoms into structured notes<br/>- simulates intake + doctor-style summary<br/>- asks follow-up questions<br/><br/><strong>DOES NOT:</strong><br/>- diagnose<br/>- prescribe<br/>- replace real doctors<br/>- handle emergencies<br/><br/><strong>This tool may be wrong, incomplete, or unsafe.</strong></div>
+  <section class="top">
+    <div class="glass banner" role="alert" aria-live="assertive">
+      <strong>Educational roleplay only — not medical advice, diagnosis, treatment, or emergency care.</strong><br/>
+      If you think you may be having a medical emergency, call 911 or go to the nearest emergency room now.<br/>
+      Do not use this tool for chest pain, trouble breathing, stroke symptoms, severe bleeding, seizures, suicidal thoughts, allergic reactions, overdose, or any urgent condition.
     </div>
-    <div class="card">
-      <div class="label">Privacy + data handling</div>
-      <div class="value">Stored data includes user input, timestamps, and AI outputs.<br/>Storage location: browser localStorage (patient id + UI state) and server JSON file (visit records).<br/>Delete logs: use “Delete logs (patient)” below.<br/><br/><strong>Do not enter sensitive real-world personal information unless you understand how it is stored.</strong></div>
-    </div>
-  </div>
+  </section>
 
-  <div class="card" style="margin-top:12px;">
-    <div class="label">Visit controls</div>
-    <label for="pid">Patient ID</label>
-    <input id="pid" aria-label="Patient ID" placeholder="patient-123" />
-    <label for="msg" style="margin-top:8px; display:block;">Complaint / update</label>
-    <textarea id="msg" rows="4" aria-label="Complaint input" placeholder="Describe symptoms..."></textarea>
-    <div class="note">Include when it started, where it hurts, severity, and what makes it better or worse.</div>
-    <div class="note">Example prompts: “I’ve had a sore throat and fever for two days.” · “My stomach hurts after eating.” · “I twisted my ankle yesterday and it’s swollen.” · “I’ve been coughing all week.”</div>
-    <div class="state" id="state">State: Idle</div>
-    <div class="toolbar">
-      <button class="primary" id="sendBtn" aria-label="Send to clinic">Send to clinic</button>
-      <button id="saveBtn" aria-label="Save visit log">Save visit log</button>
-      <button id="exportBtn" aria-label="Export visit summary">Export visit summary</button>
-      <button id="resetBtn" aria-label="Reset current visit">Reset visit</button>
-      <button class="danger" id="deleteBtn" aria-label="Delete logs for patient">Delete logs (patient)</button>
-    </div>
-  </div>
+  <section class="main-grid">
+    <article class="glass panel">
+      <h3>Roleplay intake · Patient input</h3>
+      <label class="small" for="pid">Patient ID</label>
+      <input id="pid" class="input" aria-label="Patient ID" placeholder="patient-123" />
+      <label class="small" for="msg" style="display:block;margin-top:8px;">Complaint / update</label>
+      <textarea id="msg" aria-label="Complaint input" placeholder="Describe symptoms clearly..."></textarea>
+      <div class="small" style="margin-top:8px">Include when it started, where it hurts, severity, and what makes it better or worse.</div>
+      <div style="margin-top:8px">
+        <span class="chip example" data-ex="I’ve had a sore throat and fever for two days.">I’ve had a sore throat and fever for two days.</span>
+        <span class="chip example" data-ex="My stomach hurts after eating.">My stomach hurts after eating.</span>
+        <span class="chip example" data-ex="I twisted my ankle yesterday and it’s swollen.">I twisted my ankle yesterday and it’s swollen.</span>
+        <span class="chip example" data-ex="I’ve been coughing all week.">I’ve been coughing all week.</span>
+      </div>
+      <div class="btns">
+        <button class="primary" id="sendBtn" aria-label="Send to clinic">Send</button>
+        <button id="saveBtn" aria-label="Save visit log">Save log</button>
+        <button id="exportBtn" aria-label="Export visit summary">Export summary</button>
+        <button id="resetBtn" aria-label="Reset session">Reset session</button>
+        <button class="danger" id="deleteBtn" aria-label="Delete logs">Delete logs</button>
+      </div>
+      <div class="small" style="margin-top:10px">
+        Stored: user input, timestamps, outputs. Location: localStorage + server JSON records.
+        Do not enter sensitive real-world personal information unless you understand how it is stored.
+      </div>
+    </article>
 
-  <div class="cards">
-    <div class="card"><div class="label">Roleplay intake</div><div id="nursePanel" class="value panel-empty">No intake yet. Submit a complaint to begin.</div><button data-copy="nursePanel">Copy</button></div>
-    <div class="card"><div class="label">Doctor-style note</div><div id="docPanel" class="value panel-empty">No doctor-style note yet.</div><button data-copy="docPanel">Copy</button></div>
-    <div class="card"><div class="label">AI follow-up</div><div id="followPanel" class="value panel-empty">No AI follow-up yet.</div><button data-copy="followPanel">Copy</button></div>
-  </div>
+    <article class="glass panel">
+      <h3>Zesty · Nurse intake</h3>
+      <div class="status-row">
+        <span class="status" id="sNurse">Nurse reviewing…</span>
+      </div>
+      <div id="nursePanel" class="content empty" aria-live="polite">No intake yet. Enter a symptom summary to begin roleplay intake.</div>
+      <div class="btns"><button data-copy="nursePanel">Copy</button></div>
+    </article>
 
-  <div class="triage" id="triageCard"><strong>This is AI guidance, not a diagnosis.</strong><div id="triageText">General discussion only</div></div>
-  <div class="card" style="margin-top:12px;">
-    <div class="label">Visit history</div>
-    <div id="history" class="value panel-empty">No saved records yet.</div>
-  </div>
+    <article class="glass panel">
+      <h3>Dr. Scarlett · Doctor-style note</h3>
+      <div class="status-row">
+        <span class="status" id="sDoctor">Doctor analyzing…</span>
+      </div>
+      <div id="docPanel" class="content empty" aria-live="polite">No doctor-style note yet. This panel updates after intake.</div>
+      <div class="btns"><button data-copy="docPanel">Copy</button></div>
+    </article>
+  </section>
+
+  <section class="bottom">
+    <article class="glass panel">
+      <h3>AI follow-up</h3>
+      <div class="status-row">
+        <span class="status" id="sFollow">Follow-up ready</span>
+      </div>
+      <div id="followPanel" class="content empty" aria-live="polite">No AI follow-up yet. Submit intake first.</div>
+      <div class="btns"><button data-copy="followPanel">Copy</button></div>
+    </article>
+    <aside class="glass triage" id="triageCard">
+      <strong>This is AI guidance, not a diagnosis.</strong>
+      <div id="triageText" style="margin-top:8px">General discussion only</div>
+      <div id="flowState" class="small" style="margin-top:10px">State: Idle</div>
+      <div id="typing" class="small" style="display:none; margin-top:8px;">Processing <span class="typing"><span></span><span></span><span></span></span></div>
+    </aside>
+  </section>
+
+  <section class="glass history">
+    <h3 style="margin:0 0 8px">Visit history</h3>
+    <div id="history" class="content empty">No saved records yet.</div>
+  </section>
 </div>
 
 <script>
-const stateEl = document.getElementById('state');
 const pidEl = document.getElementById('pid');
 const msgEl = document.getElementById('msg');
 const nursePanel = document.getElementById('nursePanel');
@@ -1276,31 +1343,53 @@ const docPanel = document.getElementById('docPanel');
 const followPanel = document.getElementById('followPanel');
 const triageText = document.getElementById('triageText');
 const historyEl = document.getElementById('history');
+const flowState = document.getElementById('flowState');
+const typingEl = document.getElementById('typing');
+const sNurse = document.getElementById('sNurse');
+const sDoctor = document.getElementById('sDoctor');
+const sFollow = document.getElementById('sFollow');
 const states = ['Idle','Collecting intake','Nurse reviewing','Doctor reviewing','Nurse follow-up ready','Visit complete'];
 pidEl.value = localStorage.getItem('nurse_patient_id') || 'anonymous';
 
-function setState(i){ stateEl.textContent = 'State: ' + states[Math.max(0, Math.min(states.length-1, i))]; }
-function setPanel(el, text){ el.textContent = text || 'No output yet.'; el.classList.remove('panel-empty'); }
+function setState(idx){
+  flowState.textContent = 'State: ' + states[Math.max(0, Math.min(states.length-1, idx))];
+  sNurse.classList.toggle('active', idx === 2);
+  sDoctor.classList.toggle('active', idx === 3);
+  sFollow.classList.toggle('active', idx >= 4);
+}
+function setPanel(el, text){
+  el.textContent = text || 'No output yet.';
+  el.classList.remove('empty');
+}
+function setLoading(on){ typingEl.style.display = on ? 'block' : 'none'; }
 
 async function fetchHistory(){
   const pid = pidEl.value.trim() || 'anonymous';
   const r = await fetch('/api/nurse/history?patient_id=' + encodeURIComponent(pid));
   const j = await r.json();
-  if(!j.records || !j.records.length){ historyEl.textContent = 'No saved records yet.'; historyEl.classList.add('panel-empty'); return; }
-  historyEl.classList.remove('panel-empty');
+  if(!j.records || !j.records.length){
+    historyEl.textContent = 'No saved records yet.';
+    historyEl.classList.add('empty');
+    return;
+  }
+  historyEl.classList.remove('empty');
   historyEl.textContent = j.records.map((x,i)=>`${i+1}. ${x.saved_at} | turns=${(x.case_summary||{}).turn_count} | flags=${((x.case_summary||{}).latest_red_flags||[]).join(', ')}`).join('\\n');
 }
+
+document.querySelectorAll('.example').forEach(x => x.addEventListener('click', () => {
+  msgEl.value = x.getAttribute('data-ex') || '';
+  msgEl.focus();
+}));
 
 document.getElementById('sendBtn').onclick = async () => {
   const pid = pidEl.value.trim() || 'anonymous';
   const message = msgEl.value.trim();
   if(!message){ alert('Please enter complaint/update text.'); return; }
   localStorage.setItem('nurse_patient_id', pid);
-  setState(1); setState(2);
+  setState(1); setLoading(true);
   const r = await fetch('/api/nurse/message', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid, message})});
   const j = await r.json();
-  if(j.interrupted){ setState(5); }
-  else { setState(3); setState(4); setState(5); }
+  setState(j.interrupted ? 5 : 4); setLoading(false); setState(5);
   setPanel(nursePanel, j.nurse_initial);
   setPanel(docPanel, j.doctor_note);
   setPanel(followPanel, j.nurse_followup);
@@ -1313,45 +1402,42 @@ document.getElementById('saveBtn').onclick = async () => {
   const pid = pidEl.value.trim() || 'anonymous';
   await fetch('/api/nurse/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid})});
   await fetchHistory();
-  alert('Visit saved.');
-};
-
-document.getElementById('resetBtn').onclick = async () => {
-  const pid = pidEl.value.trim() || 'anonymous';
-  await fetch('/api/nurse/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid})});
-  setState(0);
-  nursePanel.textContent = 'No intake yet. Submit a complaint to begin.'; nursePanel.classList.add('panel-empty');
-  docPanel.textContent = 'No doctor-style note yet.'; docPanel.classList.add('panel-empty');
-  followPanel.textContent = 'No AI follow-up yet.'; followPanel.classList.add('panel-empty');
-  triageText.textContent = 'General discussion only';
-  alert('Visit reset. You can continue by sending a new intake message.');
-};
-
-document.getElementById('deleteBtn').onclick = async () => {
-  const pid = pidEl.value.trim() || 'anonymous';
-  await fetch('/api/nurse/history?patient_id=' + encodeURIComponent(pid), {method:'DELETE'});
-  await fetchHistory();
-  alert('Deleted saved logs for patient: ' + pid);
 };
 
 document.getElementById('exportBtn').onclick = async () => {
   const pid = pidEl.value.trim() || 'anonymous';
   const r = await fetch('/api/nurse/export?patient_id=' + encodeURIComponent(pid));
   const j = await r.json();
-  navigator.clipboard.writeText(JSON.stringify(j, null, 2));
-  alert('Visit summary copied to clipboard.');
+  await navigator.clipboard.writeText(JSON.stringify(j, null, 2));
+  alert('Visit summary copied.');
+};
+
+document.getElementById('resetBtn').onclick = async () => {
+  const pid = pidEl.value.trim() || 'anonymous';
+  await fetch('/api/nurse/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({patient_id: pid})});
+  setState(0);
+  nursePanel.textContent = 'No intake yet. Enter a symptom summary to begin roleplay intake.'; nursePanel.classList.add('empty');
+  docPanel.textContent = 'No doctor-style note yet. This panel updates after intake.'; docPanel.classList.add('empty');
+  followPanel.textContent = 'No AI follow-up yet. Submit intake first.'; followPanel.classList.add('empty');
+  triageText.textContent = 'General discussion only';
+};
+
+document.getElementById('deleteBtn').onclick = async () => {
+  const pid = pidEl.value.trim() || 'anonymous';
+  await fetch('/api/nurse/history?patient_id=' + encodeURIComponent(pid), {method:'DELETE'});
+  await fetchHistory();
 };
 
 document.querySelectorAll('button[data-copy]').forEach(btn => btn.onclick = async () => {
   const id = btn.getAttribute('data-copy');
-  const text = document.getElementById(id).textContent || '';
-  await navigator.clipboard.writeText(text);
-  alert('Copied.');
+  await navigator.clipboard.writeText(document.getElementById(id).textContent || '');
 });
 
+setState(0);
 fetchHistory();
 </script>
-</body></html>"""
+</body>
+</html>"""
 
 
 def create_web_app() -> Any:
